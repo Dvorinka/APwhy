@@ -1,0 +1,13 @@
+node_modules
+.env
+npm-debug.log*
+data
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+bun.lock
+bun.lockb
+bin
+internal/api/static/assets
+internal/api/static/*.css
+internal/api/static/*.js

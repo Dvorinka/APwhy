@@ -1,0 +1,42 @@
+@import "@fontsource/manrope/400.css";
+@import "@fontsource/manrope/600.css";
+@import "@fontsource/manrope/700.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 0 0% 9%;
+  --foreground: 0 0% 94%;
+  --card: 0 0% 12%;
+  --card-foreground: 0 0% 93%;
+  --primary: 354 89% 61%;
+  --primary-foreground: 0 0% 8%;
+  --secondary: 0 0% 18%;
+  --secondary-foreground: 0 0% 92%;
+  --muted: 0 0% 17%;
+  --muted-foreground: 0 0% 74%;
+  --accent: 354 89% 61%;
+  --accent-foreground: 0 0% 95%;
+  --destructive: 354 89% 61%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 0 0% 24%;
+  --input: 0 0% 20%;
+  --ring: 354 89% 61%;
+}
+
+* {
+  @apply border-border;
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+  font-family: Manrope, ui-sans-serif, system-ui, sans-serif;
+}
+
+code,
+pre {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+}

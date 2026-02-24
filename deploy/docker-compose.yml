@@ -1,0 +1,112 @@
+services:
+  apwhy:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        VITE_BASE_PATH: ${VITE_BASE_PATH:-/}
+    container_name: apwhy
+    restart: unless-stopped
+    environment:
+      APWHY_PORT: 3001
+      SQLITE_DB_PATH: /data/apwhy.sqlite
+      DASHBOARD_UI_BASE_PATH: ${DASHBOARD_UI_BASE_PATH:-/}
+      API_KEY_HEADER: ${API_KEY_HEADER:-x-api-key}
+      SERVICE_TOKEN_HEADER: ${SERVICE_TOKEN_HEADER:-x-apwhy-service-token}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
+      UMAMI_BASE_URL: http://umami:3000
+      UMAMI_API_KEY: ${UMAMI_API_KEY:-}
+      UMAMI_WEBSITE_ID: ${UMAMI_WEBSITE_ID:-}
+    volumes:
+      - apwhy-data:/data
+    networks:
+      - proxy
+      - internal
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.apwhy.rule=Host(`${APWHY_DOMAIN:-apwhy.localhost}`)
+      - traefik.http.routers.apwhy.entrypoints=web
+      - traefik.http.services.apwhy.loadbalancer.server.port=3001
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "-", "http://127.0.0.1:3001/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    mem_limit: 256m
+    cpus: 0.50
+
+  traefik:
+    image: traefik:v3.2
+    container_name: apwhy-traefik
+    restart: unless-stopped
+    command:
+      - --api.dashboard=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - proxy
+    mem_limit: 128m
+    cpus: 0.50
+
+  umami-db:
+    image: postgres:16-alpine
+    container_name: umami-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: umami
+      POSTGRES_USER: umami
+      POSTGRES_PASSWORD: ${UMAMI_DB_PASSWORD:-umami}
+    volumes:
+      - umami-db:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U umami -d umami"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+    mem_limit: 512m
+    cpus: 0.75
+
+  umami:
+    image: ghcr.io/umami-software/umami:postgresql-latest
+    container_name: umami
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://umami:${UMAMI_DB_PASSWORD:-umami}@umami-db:5432/umami
+      DATABASE_TYPE: postgresql
+      HASH_SALT: ${UMAMI_HASH_SALT:-change-me-very-long-random-salt}
+      APP_SECRET: ${UMAMI_APP_SECRET:-change-me-very-long-secret}
+    depends_on:
+      umami-db:
+        condition: service_healthy
+    networks:
+      - proxy
+      - internal
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.umami.rule=Host(`${UMAMI_DOMAIN:-umami.localhost}`)
+      - traefik.http.routers.umami.entrypoints=web
+      - traefik.http.services.umami.loadbalancer.server.port=3000
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "-", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+    mem_limit: 384m
+    cpus: 0.75
+
+volumes:
+  apwhy-data:
+  umami-db:
+
+networks:
+  proxy:
+  internal:
