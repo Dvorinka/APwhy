@@ -1,0 +1,55 @@
+services:
+  apwhy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: apwhy
+    restart: unless-stopped
+    environment:
+      APWHY_PORT: 3001
+      DATABASE_URL: postgresql://apwhy:${APWHY_DB_PASSWORD:-apwhy123}@apwhy-db:5432/apwhy
+      UMAMI_SCRIPT_URL: ${UMAMI_SCRIPT_URL:-}
+      UMAMI_WEBSITE_ID: ${UMAMI_WEBSITE_ID:-}
+    depends_on:
+      apwhy-db:
+        condition: service_healthy
+    networks:
+      - apwhy-network
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "-", "http://127.0.0.1:3001/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    mem_limit: 256m
+    cpus: 0.50
+
+  apwhy-db:
+    image: postgres:15-alpine
+    container_name: apwhy-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: apwhy
+      POSTGRES_USER: apwhy
+      POSTGRES_PASSWORD: ${APWHY_DB_PASSWORD:-apwhy123}
+    volumes:
+      - apwhy-db:/var/lib/postgresql/data
+    networks:
+      - apwhy-network
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apwhy -d apwhy"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+    mem_limit: 512m
+    cpus: 0.75
+
+volumes:
+  apwhy-db:
+
+networks:
+  apwhy-network:
+    driver: bridge

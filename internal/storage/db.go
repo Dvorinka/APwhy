@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "modernc.org/sqlite"
 
 	"apwhy/internal/auth"
 	"apwhy/internal/config"
@@ -19,8 +19,14 @@ import (
 )
 
 type Store struct {
-	DB  *sql.DB
-	Cfg config.Config
+	DB                    *sql.DB
+	Cfg                   config.Config
+	useDollarPlaceholders bool
+}
+
+type Tx struct {
+	tx                    *sql.Tx
+	useDollarPlaceholders bool
 }
 
 func NowISO() string {
@@ -28,17 +34,21 @@ func NowISO() string {
 }
 
 func Open(cfg config.Config) (*Store, error) {
-	db, err := sql.Open("sqlite", cfg.SQLitePath)
+	db, err := sql.Open("pgx", cfg.DatabaseURL)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 
-	if _, err := db.Exec(schemaSQL); err != nil {
+	if _, err := db.Exec(postgresSchemaSQL); err != nil {
 		return nil, fmt.Errorf("failed to apply schema: %w", err)
 	}
 
-	s := &Store{DB: db, Cfg: cfg}
+	s := &Store{
+		DB:                    db,
+		Cfg:                   cfg,
+		useDollarPlaceholders: isPostgresURL(cfg.DatabaseURL),
+	}
 	if err := s.seedAccessControl(context.Background()); err != nil {
 		return nil, err
 	}
@@ -50,7 +60,7 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) seedAccessControl(ctx context.Context) error {
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -221,6 +231,75 @@ func toNullInt(value *int) sql.NullInt64 {
 		return sql.NullInt64{}
 	}
 	return sql.NullInt64{Valid: true, Int64: int64(*value)}
+}
+
+func isPostgresURL(databaseURL string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(databaseURL))
+	return strings.HasPrefix(normalized, "postgres://") || strings.HasPrefix(normalized, "postgresql://")
+}
+
+func rebindQuery(query string, useDollarPlaceholders bool) string {
+	if !useDollarPlaceholders || !strings.Contains(query, "?") {
+		return query
+	}
+
+	var out strings.Builder
+	out.Grow(len(query) + 8)
+	argPos := 1
+	for i := 0; i < len(query); i++ {
+		if query[i] == '?' {
+			out.WriteByte('$')
+			out.WriteString(strconv.Itoa(argPos))
+			argPos++
+			continue
+		}
+		out.WriteByte(query[i])
+	}
+	return out.String()
+}
+
+func (s *Store) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
+	tx, err := s.DB.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Tx{tx: tx, useDollarPlaceholders: s.useDollarPlaceholders}, nil
+}
+
+func (s *Store) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return s.DB.ExecContext(ctx, rebindQuery(query, s.useDollarPlaceholders), args...)
+}
+
+func (s *Store) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return s.DB.QueryContext(ctx, rebindQuery(query, s.useDollarPlaceholders), args...)
+}
+
+func (s *Store) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return s.DB.QueryRowContext(ctx, rebindQuery(query, s.useDollarPlaceholders), args...)
+}
+
+func (s *Store) Exec(query string, args ...any) (sql.Result, error) {
+	return s.DB.Exec(rebindQuery(query, s.useDollarPlaceholders), args...)
+}
+
+func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return tx.tx.ExecContext(ctx, rebindQuery(query, tx.useDollarPlaceholders), args...)
+}
+
+func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return tx.tx.QueryContext(ctx, rebindQuery(query, tx.useDollarPlaceholders), args...)
+}
+
+func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return tx.tx.QueryRowContext(ctx, rebindQuery(query, tx.useDollarPlaceholders), args...)
+}
+
+func (tx *Tx) Commit() error {
+	return tx.tx.Commit()
+}
+
+func (tx *Tx) Rollback() error {
+	return tx.tx.Rollback()
 }
 
 func scanJSONText(value sql.NullString) string {

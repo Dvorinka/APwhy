@@ -32,10 +32,11 @@ import (
 var staticFS embed.FS
 
 type Server struct {
-	Store       *storage.Store
-	Cfg         config.Config
-	Umami       *analytics.Client
-	proxyClient *http.Client
+	Store         *storage.Store
+	Cfg           config.Config
+	Umami         *analytics.Client
+	DeployService *DeployService
+	proxyClient   *http.Client
 
 	rpmMu    sync.Mutex
 	rpmUsage map[string]rpmWindow
@@ -54,6 +55,8 @@ type loginWindow struct {
 	Count       int
 }
 
+var errBootstrapClosed = errors.New("bootstrap registration is closed")
+
 type authContext struct {
 	UserID             string
 	Email              string
@@ -66,9 +69,10 @@ type authContext struct {
 
 func NewServer(store *storage.Store, cfg config.Config) *Server {
 	return &Server{
-		Store: store,
-		Cfg:   cfg,
-		Umami: analytics.NewClient(cfg.UmamiBaseURL, cfg.UmamiAPIKey, cfg.UmamiWebsiteID),
+		Store:         store,
+		Cfg:           cfg,
+		DeployService: NewDeployService(),
+		Umami:         analytics.NewClient("", "", cfg.UmamiWebsiteID),
 		proxyClient: &http.Client{
 			Timeout: cfg.DefaultServiceTimeout,
 		},
@@ -86,6 +90,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/bootstrap/register-owner", s.handleBootstrapRegisterOwner)
 
 	mux.HandleFunc("POST /api/v1/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("POST /api/v1/auth/register", s.handleAuthRegister)
 	mux.HandleFunc("POST /api/v1/auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("POST /api/v1/auth/refresh", s.handleAuthRefresh)
 	mux.HandleFunc("GET /api/v1/auth/me", s.withAuth("", true, s.handleAuthMe))
@@ -117,6 +122,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/analytics/ops", s.withAuth("analytics.read", false, s.handleAnalyticsOps))
 	mux.HandleFunc("GET /api/v1/analytics/traffic", s.withAuth("analytics.read", false, s.handleAnalyticsTraffic))
 	mux.HandleFunc("POST /api/v1/analytics/events", s.withAuth("", true, s.handleAnalyticsEvents))
+	mux.HandleFunc("POST /api/v1/deploy", s.withAuth("deploy.write", false, func(w http.ResponseWriter, r *http.Request, _ *authContext) {
+		s.handleDeployCreate(w, r)
+	}))
+	mux.HandleFunc("GET /api/v1/deploy", s.withAuth("deploy.read", false, func(w http.ResponseWriter, r *http.Request, _ *authContext) {
+		s.handleDeployList(w, r)
+	}))
+	mux.HandleFunc("GET /api/v1/deploy/{id}", s.withAuth("deploy.read", false, func(w http.ResponseWriter, r *http.Request, _ *authContext) {
+		s.handleDeployGet(w, r)
+	}))
+	mux.HandleFunc("POST /api/v1/deploy/{id}/stop", s.withAuth("deploy.write", false, func(w http.ResponseWriter, r *http.Request, _ *authContext) {
+		s.handleDeployStop(w, r)
+	}))
+	mux.HandleFunc("GET /api/v1/deploy/{id}/logs", s.withAuth("deploy.read", false, func(w http.ResponseWriter, r *http.Request, _ *authContext) {
+		s.handleDeployLogs(w, r)
+	}))
 
 	mux.HandleFunc("/", s.handleGatewayOrUI)
 
@@ -191,11 +211,6 @@ func (s *Server) handleBootstrapStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBootstrapRegisterOwner(w http.ResponseWriter, r *http.Request) {
-	if s.hasUsers(r.Context()) {
-		writeError(w, http.StatusForbidden, "BOOTSTRAP_CLOSED", "Owner registration is closed")
-		return
-	}
-
 	var input struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
@@ -211,45 +226,21 @@ func (s *Server) handleBootstrapRegisterOwner(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	hash, err := auth.HashPassword(input.Password)
+	userID, err := s.registerInitialOwner(r.Context(), input.Email, input.Password)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_PASSWORD", err.Error())
-		return
-	}
-
-	now := storage.NowISO()
-	userID, _ := auth.RandomID("usr")
-
-	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "DB_ERROR", "Failed to start transaction")
-		return
-	}
-	defer tx.Rollback()
-
-	_, err = tx.ExecContext(r.Context(), `
-		INSERT INTO users (id, email, password_hash, enabled, force_password_reset, created_at, updated_at)
-		VALUES (?, ?, ?, 1, 0, ?, ?)
-	`, userID, input.Email, hash, now, now)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "USER_CREATE_FAILED", "Email already exists")
-		return
-	}
-
-	ownerRoleID := ""
-	if err := tx.QueryRowContext(r.Context(), `SELECT id FROM roles WHERE slug = 'owner'`).Scan(&ownerRoleID); err != nil {
-		writeError(w, http.StatusInternalServerError, "ROLE_MISSING", "Owner role not found")
-		return
-	}
-
-	_, err = tx.ExecContext(r.Context(), `INSERT INTO user_roles (user_id, role_id, created_at) VALUES (?, ?, ?)`, userID, ownerRoleID, now)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "ROLE_ASSIGN_FAILED", "Failed to assign owner role")
-		return
-	}
-
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, "DB_ERROR", "Failed to commit owner registration")
+		if errors.Is(err, errBootstrapClosed) {
+			writeError(w, http.StatusForbidden, "BOOTSTRAP_CLOSED", "Owner registration is closed")
+			return
+		}
+		if strings.Contains(err.Error(), "password must be at least 8 characters") {
+			writeError(w, http.StatusBadRequest, "INVALID_PASSWORD", err.Error())
+			return
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "email already exists") {
+			writeError(w, http.StatusBadRequest, "USER_CREATE_FAILED", "Email already exists")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "OWNER_CREATE_FAILED", err.Error())
 		return
 	}
 
@@ -261,6 +252,72 @@ func (s *Server) handleBootstrapRegisterOwner(w http.ResponseWriter, r *http.Req
 			"id":    userID,
 			"email": input.Email,
 			"roles": []string{"owner"},
+		},
+	})
+}
+
+func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(r.Body, &input); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_BODY", err.Error())
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(input.Email))
+	if email == "" || !strings.Contains(email, "@") {
+		writeError(w, http.StatusBadRequest, "INVALID_EMAIL", "Valid email is required")
+		return
+	}
+
+	userID, err := s.registerInitialOwner(r.Context(), email, input.Password)
+	if err != nil {
+		if errors.Is(err, errBootstrapClosed) {
+			writeError(w, http.StatusForbidden, "REGISTRATION_CLOSED", "Registration is closed")
+			return
+		}
+		if strings.Contains(err.Error(), "password must be at least 8 characters") {
+			writeError(w, http.StatusBadRequest, "INVALID_PASSWORD", err.Error())
+			return
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "email already exists") {
+			writeError(w, http.StatusBadRequest, "USER_CREATE_FAILED", "Email already exists")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "REGISTER_FAILED", err.Error())
+		return
+	}
+
+	sessionID, accessToken, refreshToken, err := s.createSession(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "SESSION_CREATE_FAILED", "Failed to create login session")
+		return
+	}
+
+	now := storage.NowISO()
+	_, _ = s.Store.ExecContext(r.Context(), `UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?`, now, now, userID)
+	s.setAuthCookies(w, accessToken, refreshToken)
+
+	authCtx, err := s.resolveAuthFromTokenHash(r.Context(), auth.HashToken(accessToken))
+	if err != nil || authCtx == nil {
+		writeError(w, http.StatusInternalServerError, "SESSION_RESOLVE_FAILED", "Failed to resolve registered user")
+		return
+	}
+
+	s.audit(r.Context(), userID, "auth.register", "session", sessionID, map[string]any{"email": email})
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"ok": true,
+		"data": map[string]any{
+			"user": map[string]any{
+				"id":                 authCtx.UserID,
+				"email":              authCtx.Email,
+				"roles":              authCtx.Roles,
+				"permissions":        keysOfMap(authCtx.Permissions),
+				"forcePasswordReset": authCtx.ForcePasswordReset,
+			},
 		},
 	})
 }
@@ -293,7 +350,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		Enabled            int
 		ForcePasswordReset int
 	}
-	err := s.Store.DB.QueryRowContext(r.Context(), `
+	err := s.Store.QueryRowContext(r.Context(), `
 		SELECT id, email, password_hash, enabled, force_password_reset
 		FROM users
 		WHERE email = ?
@@ -324,7 +381,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := storage.NowISO()
-	_, _ = s.Store.DB.ExecContext(r.Context(), `UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?`, now, now, user.ID)
+	_, _ = s.Store.ExecContext(r.Context(), `UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?`, now, now, user.ID)
 	_ = sessionID
 
 	s.setAuthCookies(w, accessToken, refreshToken)
@@ -352,17 +409,17 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
-	accessCookie, _ := r.Cookie(s.Cfg.SessionAccessCookie)
-	refreshCookie, _ := r.Cookie(s.Cfg.SessionRefreshCookie)
+	accessCookie, _ := r.Cookie("apwhy_access")
+	refreshCookie, _ := r.Cookie("apwhy_refresh")
 
 	now := storage.NowISO()
 	if accessCookie != nil {
-		_, _ = s.Store.DB.ExecContext(r.Context(), `
+		_, _ = s.Store.ExecContext(r.Context(), `
 			UPDATE sessions SET revoked_at = ?, updated_at = ? WHERE access_token_hash = ?
 		`, now, now, auth.HashToken(accessCookie.Value))
 	}
 	if refreshCookie != nil {
-		_, _ = s.Store.DB.ExecContext(r.Context(), `
+		_, _ = s.Store.ExecContext(r.Context(), `
 			UPDATE sessions SET revoked_at = ?, updated_at = ? WHERE refresh_token_hash = ?
 		`, now, now, auth.HashToken(refreshCookie.Value))
 	}
@@ -372,7 +429,7 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
-	refreshCookie, err := r.Cookie(s.Cfg.SessionRefreshCookie)
+	refreshCookie, err := r.Cookie("apwhy_refresh")
 	if err != nil || strings.TrimSpace(refreshCookie.Value) == "" {
 		writeError(w, http.StatusUnauthorized, "REFRESH_MISSING", "Refresh token is missing")
 		return
@@ -386,7 +443,7 @@ func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt string
 		RevokedAt sql.NullString
 	}
-	err = s.Store.DB.QueryRowContext(r.Context(), `
+	err = s.Store.QueryRowContext(r.Context(), `
 		SELECT id, user_id, refresh_expires_at, revoked_at
 		FROM sessions
 		WHERE refresh_token_hash = ?
@@ -410,10 +467,10 @@ func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
 	accessHash := auth.HashToken(accessToken)
 	refreshHashNew := auth.HashToken(newRefreshToken)
 
-	accessExp := time.Now().Add(s.Cfg.AccessTokenTTL).UTC().Format(time.RFC3339)
-	refreshExp := time.Now().Add(s.Cfg.RefreshTokenTTL).UTC().Format(time.RFC3339)
+	accessExp := time.Now().Add(15 * time.Minute).UTC().Format(time.RFC3339)
+	refreshExp := time.Now().Add(168 * time.Hour).UTC().Format(time.RFC3339)
 
-	_, err = s.Store.DB.ExecContext(r.Context(), `
+	_, err = s.Store.ExecContext(r.Context(), `
 		UPDATE sessions
 		SET access_token_hash = ?, refresh_token_hash = ?, access_expires_at = ?, refresh_expires_at = ?, updated_at = ?
 		WHERE id = ?
@@ -455,7 +512,7 @@ func (s *Server) handleAuthResetPassword(w http.ResponseWriter, r *http.Request,
 	}
 
 	now := storage.NowISO()
-	_, err = s.Store.DB.ExecContext(r.Context(), `
+	_, err = s.Store.ExecContext(r.Context(), `
 		UPDATE users SET password_hash = ?, force_password_reset = 0, updated_at = ? WHERE id = ?
 	`, hash, now, ctx.UserID)
 	if err != nil {
@@ -468,7 +525,7 @@ func (s *Server) handleAuthResetPassword(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) handleUsersList(w http.ResponseWriter, r *http.Request, ctx *authContext) {
-	rows, err := s.Store.DB.QueryContext(r.Context(), `
+	rows, err := s.Store.QueryContext(r.Context(), `
 		SELECT u.id, u.email, u.enabled, u.force_password_reset, u.created_at, u.updated_at,
 			COALESCE(GROUP_CONCAT(r.slug), '') AS role_slugs
 		FROM users u
@@ -551,7 +608,7 @@ func (s *Server) handleUsersCreate(w http.ResponseWriter, r *http.Request, ctx *
 	userID, _ := auth.RandomID("usr")
 	inviteID, _ := auth.RandomID("inv")
 
-	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
+	tx, err := s.Store.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "DB_ERROR", "Failed to start transaction")
 		return
@@ -622,7 +679,7 @@ func (s *Server) handleUsersPatch(w http.ResponseWriter, r *http.Request, ctx *a
 	}
 
 	now := storage.NowISO()
-	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
+	tx, err := s.Store.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "DB_ERROR", "Failed to start transaction")
 		return
@@ -685,7 +742,7 @@ func (s *Server) handleUsersPatch(w http.ResponseWriter, r *http.Request, ctx *a
 }
 
 func (s *Server) handleRolesList(w http.ResponseWriter, r *http.Request, ctx *authContext) {
-	rows, err := s.Store.DB.QueryContext(r.Context(), `
+	rows, err := s.Store.QueryContext(r.Context(), `
 		SELECT r.id, r.name, r.slug, r.description, r.is_system, r.enabled,
 			COALESCE(GROUP_CONCAT(p.code), '') AS permission_codes,
 			r.created_at, r.updated_at
@@ -750,7 +807,7 @@ func (s *Server) handleRolesCreate(w http.ResponseWriter, r *http.Request, ctx *
 	id, _ := auth.RandomID("role")
 	now := storage.NowISO()
 
-	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
+	tx, err := s.Store.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "DB_ERROR", "Failed to start transaction")
 		return
@@ -799,13 +856,13 @@ func (s *Server) handleRolesPatch(w http.ResponseWriter, r *http.Request, ctx *a
 	}
 
 	isSystem := 0
-	if err := s.Store.DB.QueryRowContext(r.Context(), `SELECT is_system FROM roles WHERE id = ?`, id).Scan(&isSystem); err != nil {
+	if err := s.Store.QueryRowContext(r.Context(), `SELECT is_system FROM roles WHERE id = ?`, id).Scan(&isSystem); err != nil {
 		writeError(w, http.StatusNotFound, "ROLE_NOT_FOUND", "Role not found")
 		return
 	}
 
 	now := storage.NowISO()
-	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
+	tx, err := s.Store.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "DB_ERROR", "Failed to start transaction")
 		return
@@ -855,7 +912,7 @@ func (s *Server) handleRolesPatch(w http.ResponseWriter, r *http.Request, ctx *a
 }
 
 func (s *Server) handlePermissionsList(w http.ResponseWriter, r *http.Request, ctx *authContext) {
-	rows, err := s.Store.DB.QueryContext(r.Context(), `SELECT id, code, name, description FROM permissions ORDER BY code ASC`)
+	rows, err := s.Store.QueryContext(r.Context(), `SELECT id, code, name, description FROM permissions ORDER BY code ASC`)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "DB_ERROR", "Failed to list permissions")
 		return
@@ -875,7 +932,7 @@ func (s *Server) handlePermissionsList(w http.ResponseWriter, r *http.Request, c
 }
 
 func (s *Server) handleServicesList(w http.ResponseWriter, r *http.Request, ctx *authContext) {
-	rows, err := s.Store.DB.QueryContext(r.Context(), `SELECT id, name, slug, upstream_url, route_prefix, health_path, upstream_auth_header, upstream_auth_value, internal_token, enabled, rpm_limit, monthly_quota, request_timeout_ms, last_validation_at, last_validation_status, last_validation_message, created_at, updated_at FROM services ORDER BY created_at DESC`)
+	rows, err := s.Store.QueryContext(r.Context(), `SELECT id, name, slug, upstream_url, route_prefix, health_path, upstream_auth_header, upstream_auth_value, internal_token, enabled, rpm_limit, monthly_quota, request_timeout_ms, last_validation_at, last_validation_status, last_validation_message, created_at, updated_at FROM services ORDER BY created_at DESC`)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "DB_ERROR", "Failed to list services")
 		return
@@ -920,7 +977,7 @@ func (s *Server) handleServicesCreate(w http.ResponseWriter, r *http.Request, ct
 	id, _ := auth.RandomID("svc")
 	slug := slugify(firstNonEmpty(input.Slug, input.Name), "service")
 
-	_, err := s.Store.DB.ExecContext(r.Context(), `
+	_, err := s.Store.ExecContext(r.Context(), `
 		INSERT INTO services (
 			id, name, slug, upstream_url, route_prefix, health_path,
 			upstream_auth_header, upstream_auth_value, internal_token,
@@ -979,7 +1036,7 @@ func (s *Server) handleServicesPatch(w http.ResponseWriter, r *http.Request, ctx
 		return
 	}
 
-	_, err = s.Store.DB.ExecContext(r.Context(), `
+	_, err = s.Store.ExecContext(r.Context(), `
 		UPDATE services SET
 		name = ?, slug = ?, upstream_url = ?, route_prefix = ?, health_path = ?,
 		upstream_auth_header = ?, upstream_auth_value = ?, internal_token = ?, enabled = ?,
@@ -1025,9 +1082,6 @@ func (s *Server) handleServicesValidate(w http.ResponseWriter, r *http.Request, 
 	if header := asString(service["upstreamAuthHeader"]); header != "" {
 		req.Header.Set(header, asString(service["upstreamAuthValue"]))
 	}
-	if token := asString(service["internalToken"]); token != "" {
-		req.Header.Set(s.Cfg.ServiceTokenHeader, token)
-	}
 	res, err := client.Do(req)
 	status := 0
 	message := ""
@@ -1047,7 +1101,7 @@ func (s *Server) handleServicesValidate(w http.ResponseWriter, r *http.Request, 
 		validationStatus = "healthy"
 	}
 
-	_, _ = s.Store.DB.ExecContext(r.Context(), `
+	_, _ = s.Store.ExecContext(r.Context(), `
 		UPDATE services
 		SET last_validation_at = ?, last_validation_status = ?, last_validation_message = ?, updated_at = ?
 		WHERE id = ?
@@ -1062,7 +1116,7 @@ func (s *Server) handleServicesValidate(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) handleDatabasesList(w http.ResponseWriter, r *http.Request, ctx *authContext) {
-	rows, err := s.Store.DB.QueryContext(r.Context(), `
+	rows, err := s.Store.QueryContext(r.Context(), `
 		SELECT id, name, slug, provider, connection_url, enabled, last_validation_at, last_validation_status, last_validation_message, created_at, updated_at
 		FROM database_connections
 		ORDER BY created_at DESC
@@ -1127,7 +1181,7 @@ func (s *Server) handleDatabasesCreate(w http.ResponseWriter, r *http.Request, c
 	id, _ := auth.RandomID("dbc")
 	slug := slugify(firstNonEmpty(input.Slug, input.Name+"-"+provider), "database")
 
-	_, err := s.Store.DB.ExecContext(r.Context(), `
+	_, err := s.Store.ExecContext(r.Context(), `
 		INSERT INTO database_connections (id, name, slug, provider, connection_url, enabled, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, id, strings.TrimSpace(input.Name), slug, provider, strings.TrimSpace(input.ConnectionURL), boolToInt(defaultBool(input.Enabled, true)), now, now)
@@ -1174,7 +1228,7 @@ func (s *Server) handleDatabasesPatch(w http.ResponseWriter, r *http.Request, ct
 		provider = norm
 	}
 
-	_, err = s.Store.DB.ExecContext(r.Context(), `
+	_, err = s.Store.ExecContext(r.Context(), `
 		UPDATE database_connections
 		SET name = ?, slug = ?, provider = ?, connection_url = ?, enabled = ?, updated_at = ?
 		WHERE id = ?
@@ -1211,7 +1265,7 @@ func (s *Server) handleDatabasesValidate(w http.ResponseWriter, r *http.Request,
 	if ok {
 		state = "healthy"
 	}
-	_, _ = s.Store.DB.ExecContext(r.Context(), `
+	_, _ = s.Store.ExecContext(r.Context(), `
 		UPDATE database_connections
 		SET last_validation_at = ?, last_validation_status = ?, last_validation_message = ?, updated_at = ?
 		WHERE id = ?
@@ -1226,7 +1280,7 @@ func (s *Server) handleDatabasesValidate(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) handleKeysList(w http.ResponseWriter, r *http.Request, ctx *authContext) {
-	rows, err := s.Store.DB.QueryContext(r.Context(), `
+	rows, err := s.Store.QueryContext(r.Context(), `
 		SELECT id, name, key_prefix, plan, allowed_service_ids, enabled, rpm_limit, monthly_quota, created_at, updated_at, last_used_at
 		FROM api_keys
 		ORDER BY created_at DESC
@@ -1299,7 +1353,7 @@ func (s *Server) handleKeysCreate(w http.ResponseWriter, r *http.Request, ctx *a
 	id, _ := auth.RandomID("key")
 	now := storage.NowISO()
 
-	_, err := s.Store.DB.ExecContext(r.Context(), `
+	_, err := s.Store.ExecContext(r.Context(), `
 		INSERT INTO api_keys (id, name, key_hash, key_prefix, plan, allowed_service_ids, enabled, rpm_limit, monthly_quota, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
@@ -1357,7 +1411,7 @@ func (s *Server) handleKeysPatch(w http.ResponseWriter, r *http.Request, ctx *au
 		RPM     sql.NullInt64
 		Monthly sql.NullInt64
 	}{}
-	err := s.Store.DB.QueryRowContext(r.Context(), `
+	err := s.Store.QueryRowContext(r.Context(), `
 		SELECT name, plan, allowed_service_ids, enabled, rpm_limit, monthly_quota
 		FROM api_keys WHERE id = ?
 	`, id).Scan(&current.Name, &current.Plan, &current.Allowed, &current.Enabled, &current.RPM, &current.Monthly)
@@ -1376,7 +1430,7 @@ func (s *Server) handleKeysPatch(w http.ResponseWriter, r *http.Request, ctx *au
 		allowed = mustJSON(input.AllowedServiceIDs)
 	}
 
-	_, err = s.Store.DB.ExecContext(r.Context(), `
+	_, err = s.Store.ExecContext(r.Context(), `
 		UPDATE api_keys
 		SET name = ?, plan = ?, allowed_service_ids = ?, enabled = ?, rpm_limit = ?, monthly_quota = ?, updated_at = ?
 		WHERE id = ?
@@ -1403,15 +1457,15 @@ func (s *Server) handleAnalyticsOps(w http.ResponseWriter, r *http.Request, ctx 
 	counts := map[string]int{}
 	for _, table := range []string{"users", "services", "database_connections", "api_keys"} {
 		var count int
-		_ = s.Store.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM `+table).Scan(&count)
+		_ = s.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM `+table).Scan(&count)
 		counts[table] = count
 	}
 
 	period := time.Now().UTC().Format("2006-01")
 	var monthlyRequests int
-	_ = s.Store.DB.QueryRowContext(r.Context(), `SELECT COALESCE(SUM(request_count), 0) FROM usage_counters WHERE period_month = ?`, period).Scan(&monthlyRequests)
+	_ = s.Store.QueryRowContext(r.Context(), `SELECT COALESCE(SUM(request_count), 0) FROM usage_counters WHERE period_month = ?`, period).Scan(&monthlyRequests)
 
-	severityRows, _ := s.Store.DB.QueryContext(r.Context(), `
+	severityRows, _ := s.Store.QueryContext(r.Context(), `
 		SELECT severity, COUNT(*) FROM incident_events
 		WHERE occurred_at >= datetime('now', '-24 hours')
 		GROUP BY severity
@@ -1428,7 +1482,7 @@ func (s *Server) handleAnalyticsOps(w http.ResponseWriter, r *http.Request, ctx 
 		}
 	}
 
-	healthRows, _ := s.Store.DB.QueryContext(r.Context(), `
+	healthRows, _ := s.Store.QueryContext(r.Context(), `
 		SELECT COALESCE(last_validation_status, 'unknown') AS status, COUNT(*)
 		FROM services
 		GROUP BY status
@@ -1445,7 +1499,7 @@ func (s *Server) handleAnalyticsOps(w http.ResponseWriter, r *http.Request, ctx 
 		}
 	}
 
-	tsRows, _ := s.Store.DB.QueryContext(r.Context(), `
+	tsRows, _ := s.Store.QueryContext(r.Context(), `
 		SELECT strftime('%Y-%m-%dT%H:00:00Z', occurred_at) AS bucket, COUNT(*)
 		FROM metrics_timeseries
 		WHERE metric = 'request_total' AND occurred_at >= datetime('now', '-24 hours')
@@ -1501,14 +1555,14 @@ func (s *Server) handleAnalyticsTraffic(w http.ResponseWriter, r *http.Request, 
 
 	traffic, err := s.Umami.FetchTraffic(r.Context(), from, to)
 	if err == nil {
-		_, _ = s.Store.DB.ExecContext(r.Context(), `
+		_, _ = s.Store.ExecContext(r.Context(), `
 			INSERT INTO umami_sync_cache (cache_key, payload_json, updated_at)
 			VALUES ('traffic', ?, ?)
 			ON CONFLICT(cache_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at
 		`, mustJSON(traffic), storage.NowISO())
 	} else {
 		var payload string
-		_ = s.Store.DB.QueryRowContext(r.Context(), `SELECT payload_json FROM umami_sync_cache WHERE cache_key = 'traffic'`).Scan(&payload)
+		_ = s.Store.QueryRowContext(r.Context(), `SELECT payload_json FROM umami_sync_cache WHERE cache_key = 'traffic'`).Scan(&payload)
 		if payload != "" {
 			_ = json.Unmarshal([]byte(payload), &traffic)
 		}
@@ -1517,7 +1571,7 @@ func (s *Server) handleAnalyticsTraffic(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	eventRows, _ := s.Store.DB.QueryContext(r.Context(), `
+	eventRows, _ := s.Store.QueryContext(r.Context(), `
 		SELECT COALESCE(json_extract(labels_json, '$.path'), 'unknown') AS path, COUNT(*)
 		FROM metrics_timeseries
 		WHERE metric = 'client_event' AND occurred_at >= datetime('now', '-7 days')
@@ -1625,9 +1679,9 @@ func (s *Server) serveWeb(w http.ResponseWriter, requestPath string) {
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, service map[string]any) {
-	secret := strings.TrimSpace(r.Header.Get(s.Cfg.APIKeyHeader))
+	secret := strings.TrimSpace(r.Header.Get("x-api-key"))
 	if secret == "" {
-		writeError(w, http.StatusUnauthorized, "API_KEY_MISSING", fmt.Sprintf("Missing API key header '%s'", s.Cfg.APIKeyHeader))
+		writeError(w, http.StatusUnauthorized, "API_KEY_MISSING", "Missing API key header 'x-api-key'")
 		return
 	}
 
@@ -1689,11 +1743,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, service map
 	if upstreamHeader := asString(service["upstreamAuthHeader"]); upstreamHeader != "" {
 		headers[upstreamHeader] = asString(service["upstreamAuthValue"])
 	}
-	if token := asString(service["internalToken"]); token != "" {
-		headers[s.Cfg.ServiceTokenHeader] = token
-	}
 
-	r.Header.Del(s.Cfg.APIKeyHeader)
+	r.Header.Del("x-api-key")
 
 	timeout := time.Duration(intFromAny(service["requestTimeoutMs"], int(s.Cfg.DefaultServiceTimeout.Milliseconds()))) * time.Millisecond
 	client := &http.Client{Timeout: timeout}
@@ -1710,7 +1761,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, service map
 	}
 
 	s.incrementUsage(r.Context(), asString(apiKey["id"]), asString(service["id"]), period)
-	_, _ = s.Store.DB.ExecContext(r.Context(), `UPDATE api_keys SET last_used_at = ?, updated_at = ? WHERE id = ?`, storage.NowISO(), storage.NowISO(), asString(apiKey["id"]))
+	_, _ = s.Store.ExecContext(r.Context(), `UPDATE api_keys SET last_used_at = ?, updated_at = ? WHERE id = ?`, storage.NowISO(), storage.NowISO(), asString(apiKey["id"]))
 	_ = s.logMetric("request_total", 1, map[string]any{"service": asString(service["slug"]), "status": statusCode})
 
 	if statusCode >= 500 {
@@ -1719,7 +1770,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, service map
 }
 
 func (s *Server) resolveAuth(r *http.Request) (*authContext, error) {
-	accessCookie, err := r.Cookie(s.Cfg.SessionAccessCookie)
+	accessCookie, err := r.Cookie("apwhy_access")
 	if err != nil || strings.TrimSpace(accessCookie.Value) == "" {
 		return nil, errors.New("access cookie missing")
 	}
@@ -1734,7 +1785,7 @@ func (s *Server) resolveAuthFromTokenHash(ctx context.Context, accessTokenHash s
 		ForcePasswordReset int
 		SessionID          string
 	}
-	err := s.Store.DB.QueryRowContext(ctx, `
+	err := s.Store.QueryRowContext(ctx, `
 		SELECT u.id, u.email, u.enabled, u.force_password_reset, sess.id
 		FROM sessions sess
 		JOIN users u ON u.id = sess.user_id
@@ -1764,7 +1815,7 @@ func (s *Server) resolveAuthFromTokenHash(ctx context.Context, accessTokenHash s
 
 func (s *Server) userAccess(ctx context.Context, userID string) ([]string, map[string]bool, error) {
 	roles := []string{}
-	roleRows, err := s.Store.DB.QueryContext(ctx, `
+	roleRows, err := s.Store.QueryContext(ctx, `
 		SELECT r.slug
 		FROM user_roles ur
 		JOIN roles r ON r.id = ur.role_id
@@ -1782,7 +1833,7 @@ func (s *Server) userAccess(ctx context.Context, userID string) ([]string, map[s
 	roleRows.Close()
 
 	permissions := map[string]bool{}
-	permRows, err := s.Store.DB.QueryContext(ctx, `
+	permRows, err := s.Store.QueryContext(ctx, `
 		SELECT DISTINCT p.code
 		FROM user_roles ur
 		JOIN role_permissions rp ON rp.role_id = ur.role_id
@@ -1812,10 +1863,10 @@ func (s *Server) createSession(ctx context.Context, userID string) (string, stri
 	refreshHash := auth.HashToken(refreshToken)
 
 	now := storage.NowISO()
-	accessExp := time.Now().Add(s.Cfg.AccessTokenTTL).UTC().Format(time.RFC3339)
-	refreshExp := time.Now().Add(s.Cfg.RefreshTokenTTL).UTC().Format(time.RFC3339)
+	accessExp := time.Now().Add(15 * time.Minute).UTC().Format(time.RFC3339)
+	refreshExp := time.Now().Add(168 * time.Hour).UTC().Format(time.RFC3339)
 
-	_, err := s.Store.DB.ExecContext(ctx, `
+	_, err := s.Store.ExecContext(ctx, `
 		INSERT INTO sessions (id, user_id, access_token_hash, refresh_token_hash, access_expires_at, refresh_expires_at, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, sessionID, userID, accessHash, refreshHash, accessExp, refreshExp, now, now)
@@ -1828,29 +1879,23 @@ func (s *Server) createSession(ctx context.Context, userID string) (string, stri
 
 func (s *Server) setAuthCookies(w http.ResponseWriter, accessToken, refreshToken string) {
 	accessCookie := &http.Cookie{
-		Name:     s.Cfg.SessionAccessCookie,
+		Name:     "apwhy_access",
 		Value:    accessToken,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   s.Cfg.CookieSecure,
+		Secure:   false,
 		SameSite: http.SameSiteLaxMode,
-		Expires:  time.Now().Add(s.Cfg.AccessTokenTTL),
-	}
-	if s.Cfg.CookieDomain != "" {
-		accessCookie.Domain = s.Cfg.CookieDomain
+		Expires:  time.Now().Add(15 * time.Minute),
 	}
 
 	refreshCookie := &http.Cookie{
-		Name:     s.Cfg.SessionRefreshCookie,
+		Name:     "apwhy_refresh",
 		Value:    refreshToken,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   s.Cfg.CookieSecure,
+		Secure:   false,
 		SameSite: http.SameSiteLaxMode,
-		Expires:  time.Now().Add(s.Cfg.RefreshTokenTTL),
-	}
-	if s.Cfg.CookieDomain != "" {
-		refreshCookie.Domain = s.Cfg.CookieDomain
+		Expires:  time.Now().Add(168 * time.Hour),
 	}
 
 	http.SetCookie(w, accessCookie)
@@ -1859,19 +1904,16 @@ func (s *Server) setAuthCookies(w http.ResponseWriter, accessToken, refreshToken
 
 func (s *Server) clearAuthCookies(w http.ResponseWriter) {
 	expired := time.Unix(0, 0)
-	for _, cookieName := range []string{s.Cfg.SessionAccessCookie, s.Cfg.SessionRefreshCookie} {
+	for _, cookieName := range []string{"apwhy_access", "apwhy_refresh"} {
 		cookie := &http.Cookie{
 			Name:     cookieName,
 			Value:    "",
 			Path:     "/",
 			HttpOnly: true,
-			Secure:   s.Cfg.CookieSecure,
+			Secure:   false,
 			SameSite: http.SameSiteLaxMode,
 			Expires:  expired,
 			MaxAge:   -1,
-		}
-		if s.Cfg.CookieDomain != "" {
-			cookie.Domain = s.Cfg.CookieDomain
 		}
 		http.SetCookie(w, cookie)
 	}
@@ -1879,8 +1921,55 @@ func (s *Server) clearAuthCookies(w http.ResponseWriter) {
 
 func (s *Server) hasUsers(ctx context.Context) bool {
 	var count int
-	_ = s.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count)
+	_ = s.Store.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count)
 	return count > 0
+}
+
+func (s *Server) registerInitialOwner(ctx context.Context, email, password string) (string, error) {
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		return "", err
+	}
+
+	tx, err := s.Store.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
+		return "", fmt.Errorf("failed to read user count: %w", err)
+	}
+	if count > 0 {
+		return "", errBootstrapClosed
+	}
+
+	now := storage.NowISO()
+	userID, _ := auth.RandomID("usr")
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO users (id, email, password_hash, enabled, force_password_reset, created_at, updated_at)
+		VALUES (?, ?, ?, 1, 0, ?, ?)
+	`, userID, email, hash, now, now)
+	if err != nil {
+		return "", fmt.Errorf("email already exists: %w", err)
+	}
+
+	ownerRoleID := ""
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM roles WHERE slug = 'owner'`).Scan(&ownerRoleID); err != nil {
+		return "", fmt.Errorf("owner role not found: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `INSERT INTO user_roles (user_id, role_id, created_at) VALUES (?, ?, ?)`, userID, ownerRoleID, now)
+	if err != nil {
+		return "", fmt.Errorf("failed to assign owner role: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("failed to commit owner registration: %w", err)
+	}
+
+	return userID, nil
 }
 
 func (s *Server) isLoginRateLimited(r *http.Request, email string) bool {
@@ -1924,7 +2013,7 @@ func (s *Server) resolveRoleIDs(ctx context.Context, roleIDs []string, roleSlugs
 				continue
 			}
 			var exists int
-			if err := s.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM roles WHERE id = ?`, id).Scan(&exists); err != nil || exists == 0 {
+			if err := s.Store.QueryRowContext(ctx, `SELECT COUNT(*) FROM roles WHERE id = ?`, id).Scan(&exists); err != nil || exists == 0 {
 				return nil, fmt.Errorf("role %s not found", id)
 			}
 			resolved = append(resolved, id)
@@ -1943,14 +2032,14 @@ func (s *Server) resolveRoleIDs(ctx context.Context, roleIDs []string, roleSlugs
 
 func (s *Server) roleIDBySlug(ctx context.Context, slug string) (string, error) {
 	id := ""
-	err := s.Store.DB.QueryRowContext(ctx, `SELECT id FROM roles WHERE slug = ?`, strings.ToLower(strings.TrimSpace(slug))).Scan(&id)
+	err := s.Store.QueryRowContext(ctx, `SELECT id FROM roles WHERE slug = ?`, strings.ToLower(strings.TrimSpace(slug))).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("role %s not found", slug)
 	}
 	return id, nil
 }
 
-func (s *Server) replaceRolePermissionsTx(ctx context.Context, tx *sql.Tx, roleID string, permissionCodes []string) error {
+func (s *Server) replaceRolePermissionsTx(ctx context.Context, tx *storage.Tx, roleID string, permissionCodes []string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM role_permissions WHERE role_id = ?`, roleID); err != nil {
 		return err
 	}
@@ -1972,7 +2061,7 @@ func (s *Server) replaceRolePermissionsTx(ctx context.Context, tx *sql.Tx, roleI
 }
 
 func (s *Server) getServiceByID(ctx context.Context, id string) (map[string]any, error) {
-	row := s.Store.DB.QueryRowContext(ctx, `
+	row := s.Store.QueryRowContext(ctx, `
 		SELECT id, name, slug, upstream_url, route_prefix, health_path, upstream_auth_header, upstream_auth_value, internal_token, enabled, rpm_limit, monthly_quota, request_timeout_ms, last_validation_at, last_validation_status, last_validation_message, created_at, updated_at
 		FROM services WHERE id = ?
 	`, id)
@@ -1985,7 +2074,7 @@ func (s *Server) getDatabaseByID(ctx context.Context, id string) (map[string]any
 		Enabled                                                       int
 		LastAt, LastStatus, LastMessage                               sql.NullString
 	}
-	err := s.Store.DB.QueryRowContext(ctx, `
+	err := s.Store.QueryRowContext(ctx, `
 		SELECT id, name, slug, provider, connection_url, enabled, last_validation_at, last_validation_status, last_validation_message, created_at, updated_at
 		FROM database_connections
 		WHERE id = ?
@@ -2058,7 +2147,7 @@ func (s *Server) getAPIKeyBySecret(ctx context.Context, secret string) (map[stri
 		Enabled                                                            int
 		RPMLimit, MonthlyQuota                                             sql.NullInt64
 	}
-	err := s.Store.DB.QueryRowContext(ctx, `
+	err := s.Store.QueryRowContext(ctx, `
 		SELECT id, name, key_prefix, plan, allowed_service_ids, enabled, rpm_limit, monthly_quota, created_at, updated_at
 		FROM api_keys
 		WHERE key_hash = ?
@@ -2084,18 +2173,18 @@ func (s *Server) planDefaults(plan string) (*int, *int) {
 	p := strings.ToLower(strings.TrimSpace(plan))
 	switch p {
 	case "free":
-		return intPtr(s.Cfg.FreeRPM), intPtr(s.Cfg.FreeMonthlyQuota)
+		return intPtr(60), intPtr(1000)
 	case "business":
-		return intPtr(s.Cfg.BusinessRPM), intPtr(s.Cfg.BusinessMonthlyQuota)
+		return intPtr(3000), intPtr(300000)
 	case "enterprise":
 		return nil, nil
 	default:
-		return intPtr(s.Cfg.ProRPM), intPtr(s.Cfg.ProMonthlyQuota)
+		return intPtr(600), intPtr(50000)
 	}
 }
 
 func (s *Server) matchService(ctx context.Context, requestPath string) (map[string]any, bool) {
-	rows, err := s.Store.DB.QueryContext(ctx, `
+	rows, err := s.Store.QueryContext(ctx, `
 		SELECT id, name, slug, upstream_url, route_prefix, health_path, upstream_auth_header, upstream_auth_value, internal_token, enabled, rpm_limit, monthly_quota, request_timeout_ms, last_validation_at, last_validation_status, last_validation_message, created_at, updated_at
 		FROM services
 		WHERE enabled = 1
@@ -2121,7 +2210,7 @@ func (s *Server) matchService(ctx context.Context, requestPath string) (map[stri
 
 func (s *Server) usageCount(ctx context.Context, apiKeyID, serviceID, period string) int {
 	var count int
-	_ = s.Store.DB.QueryRowContext(ctx, `
+	_ = s.Store.QueryRowContext(ctx, `
 		SELECT COALESCE(request_count, 0)
 		FROM usage_counters
 		WHERE api_key_id = ? AND service_id = ? AND period_month = ?
@@ -2130,7 +2219,7 @@ func (s *Server) usageCount(ctx context.Context, apiKeyID, serviceID, period str
 }
 
 func (s *Server) incrementUsage(ctx context.Context, apiKeyID, serviceID, period string) {
-	_, _ = s.Store.DB.ExecContext(ctx, `
+	_, _ = s.Store.ExecContext(ctx, `
 		INSERT INTO usage_counters (api_key_id, service_id, period_month, request_count, updated_at)
 		VALUES (?, ?, ?, 1, ?)
 		ON CONFLICT(api_key_id, service_id, period_month)
@@ -2172,7 +2261,7 @@ func (s *Server) allowRPM(bucket string, limit int) (bool, int) {
 }
 
 func (s *Server) logIncident(ctx context.Context, serviceID, apiKeyID sql.NullString, code, message, severity string, httpStatus sql.NullInt64) error {
-	_, err := s.Store.DB.ExecContext(ctx, `
+	_, err := s.Store.ExecContext(ctx, `
 		INSERT INTO incident_events (service_id, api_key_id, code, message, severity, http_status, count, occurred_at)
 		VALUES (?, ?, ?, ?, ?, ?, 1, ?)
 	`, serviceID, apiKeyID, code, message, severity, httpStatus, storage.NowISO())
@@ -2180,7 +2269,7 @@ func (s *Server) logIncident(ctx context.Context, serviceID, apiKeyID sql.NullSt
 }
 
 func (s *Server) logMetric(metric string, value float64, labels map[string]any) error {
-	_, err := s.Store.DB.Exec(`
+	_, err := s.Store.Exec(`
 		INSERT INTO metrics_timeseries (metric, value, labels_json, occurred_at)
 		VALUES (?, ?, ?, ?)
 	`, metric, value, mustJSON(labels), storage.NowISO())
@@ -2188,7 +2277,7 @@ func (s *Server) logMetric(metric string, value float64, labels map[string]any) 
 }
 
 func (s *Server) audit(ctx context.Context, actorUserID, action, targetType, targetID string, payload any) {
-	_, _ = s.Store.DB.ExecContext(ctx, `
+	_, _ = s.Store.ExecContext(ctx, `
 		INSERT INTO audit_log (actor_user_id, action, target_type, target_id, payload_json, occurred_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, nullIfEmpty(actorUserID), action, nullIfEmpty(targetType), nullIfEmpty(targetID), mustJSON(payload), storage.NowISO())
@@ -2684,6 +2773,94 @@ func (s serviceInput) MonthlyQuotaOr(value any) *int {
 		return s.MonthlyQuota
 	}
 	return nullIntValueFromAny(value)
+}
+
+// Deployment handlers
+func (s *Server) handleDeployCreate(w http.ResponseWriter, r *http.Request) {
+	var req DeployRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", "Invalid JSON")
+		return
+	}
+
+	deployment, err := s.DeployService.CreateDeployment(r.Context(), req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DEPLOY_FAILED", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(deployment)
+}
+
+func (s *Server) handleDeployList(w http.ResponseWriter, r *http.Request) {
+	deployments := s.DeployService.ListDeployments()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"deployments": deployments,
+	})
+}
+
+func (s *Server) handleDeployGet(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "MISSING_ID", "Deployment ID required")
+		return
+	}
+
+	deployment, exists := s.DeployService.GetDeployment(id)
+	if !exists {
+		writeError(w, http.StatusNotFound, "DEPLOY_NOT_FOUND", "Deployment not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(deployment)
+}
+
+func (s *Server) handleDeployStop(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "MISSING_ID", "Deployment ID required")
+		return
+	}
+
+	if err := s.DeployService.StopDeployment(r.Context(), id); err != nil {
+		writeError(w, http.StatusBadRequest, "DEPLOY_STOP_FAILED", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "Deployment stopped",
+	})
+}
+
+func (s *Server) handleDeployLogs(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "MISSING_ID", "Deployment ID required")
+		return
+	}
+
+	lines := 0 // default to all lines
+	if linesStr := r.URL.Query().Get("lines"); linesStr != "" {
+		if parsed, err := strconv.Atoi(linesStr); err == nil {
+			lines = parsed
+		}
+	}
+
+	logs, err := s.DeployService.GetDeploymentLogs(r.Context(), id, lines)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "LOGS_FAILED", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"logs": logs,
+	})
 }
 
 func (s serviceInput) TimeoutOr(value any) *int {

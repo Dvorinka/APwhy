@@ -6,7 +6,7 @@ It combines:
 - API service routing + key protection
 - owner-first authentication bootstrap
 - role/permission access control
-- SQLite control-plane state
+- PostgreSQL control-plane state
 - operations + traffic analytics (including Umami API integration)
 - standalone Docker deployment with Traefik + Umami
 
@@ -18,18 +18,19 @@ APwhy is intentionally memorable and a little funny: every API request eventuall
 - Frontend: SolidJS + Tailwind (modular `web/src/features/*`)
 - Auth: cookie sessions with rotating refresh tokens
 - Passwords: Argon2id hashing
-- DB: SQLite default control-plane DB
+- DB: PostgreSQL
 - Deploy: Docker + Traefik + Umami
 - Theme: dark modern red UI (no gradients)
 
 ## Core Product Flows
 ### 1) Owner Bootstrap
 - `GET /api/v1/bootstrap/status` checks if users exist.
-- If no users, `POST /api/v1/bootstrap/register-owner` is allowed.
+- If no users, `POST /api/v1/auth/register` (or `POST /api/v1/bootstrap/register-owner`) is allowed.
 - After first user is created, registration closes permanently.
 
 ### 2) Auth + Sessions
 - `POST /api/v1/auth/login`
+- `POST /api/v1/auth/register` (only while bootstrap is open)
 - `POST /api/v1/auth/logout`
 - `POST /api/v1/auth/refresh`
 - `GET /api/v1/auth/me`
@@ -51,6 +52,11 @@ Sessions are HTTP-only cookies with short-lived access tokens and rotating refre
 - Ops metrics: `GET /api/v1/analytics/ops`
 - Traffic metrics: `GET /api/v1/analytics/traffic`
 - Client tracking bridge: `POST /api/v1/analytics/events`
+
+### 6) App Deployments
+- Deployments: `POST|GET /api/v1/deploy`, `GET /api/v1/deploy/:id`, `POST /api/v1/deploy/:id/stop`, `GET /api/v1/deploy/:id/logs`
+- Build strategy: Railpack + Docker first (multi-language support)
+- Fallback: Go build/process for repositories containing `go.mod`
 
 APwhy stores operational events locally and can ingest Umami API stats for traffic dashboards.
 

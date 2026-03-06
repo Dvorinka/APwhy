@@ -32,7 +32,7 @@ export async function fetchBootstrapStatus(): Promise<BootstrapStatus> {
 }
 
 export async function registerOwner(email: string, password: string) {
-  return request("/api/v1/bootstrap/register-owner", {
+  return request("/api/v1/auth/register", {
     method: "POST",
     body: JSON.stringify({ email, password }),
   });

@@ -18,6 +18,8 @@ var PermissionSeeds = []PermissionSeed{
 	{Code: "roles.read", Name: "Read Roles", Description: "View roles and permissions."},
 	{Code: "roles.write", Name: "Manage Roles", Description: "Create and modify roles and permissions."},
 	{Code: "analytics.read", Name: "Read Analytics", Description: "View ops and traffic analytics."},
+	{Code: "deploy.read", Name: "Read Deployments", Description: "View deployment status and logs."},
+	{Code: "deploy.write", Name: "Manage Deployments", Description: "Create, stop, and manage deployments."},
 	{Code: "settings.write", Name: "Manage Settings", Description: "Modify system settings and integrations."},
 }
 
@@ -27,7 +29,7 @@ var OwnerPermissionCodes = []string{
 	"keys.read", "keys.write",
 	"users.read", "users.write",
 	"roles.read", "roles.write",
-	"analytics.read", "settings.write",
+	"analytics.read", "deploy.read", "deploy.write", "settings.write",
 }
 
 var AdminPermissionCodes = []string{

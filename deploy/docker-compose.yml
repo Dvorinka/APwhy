@@ -3,26 +3,21 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-      args:
-        VITE_BASE_PATH: ${VITE_BASE_PATH:-/}
     container_name: apwhy
     restart: unless-stopped
     environment:
       APWHY_PORT: 3001
-      SQLITE_DB_PATH: /data/apwhy.sqlite
-      DASHBOARD_UI_BASE_PATH: ${DASHBOARD_UI_BASE_PATH:-/}
-      API_KEY_HEADER: ${API_KEY_HEADER:-x-api-key}
-      SERVICE_TOKEN_HEADER: ${SERVICE_TOKEN_HEADER:-x-apwhy-service-token}
-      COOKIE_SECURE: ${COOKIE_SECURE:-false}
-      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
-      UMAMI_BASE_URL: http://umami:3000
-      UMAMI_API_KEY: ${UMAMI_API_KEY:-}
+      DATABASE_URL: postgresql://apwhy:${APWHY_DB_PASSWORD:-apwhy123}@apwhy-db:5432/apwhy
+      UMAMI_SCRIPT_URL: ${UMAMI_SCRIPT_URL:-}
       UMAMI_WEBSITE_ID: ${UMAMI_WEBSITE_ID:-}
     volumes:
       - apwhy-data:/data
     networks:
       - proxy
       - internal
+    depends_on:
+      apwhy-db:
+        condition: service_healthy
     labels:
       - traefik.enable=true
       - traefik.http.routers.apwhy.rule=Host(`${APWHY_DOMAIN:-apwhy.localhost}`)
@@ -35,6 +30,26 @@ services:
       retries: 5
     mem_limit: 256m
     cpus: 0.50
+
+  apwhy-db:
+    image: postgres:16-alpine
+    container_name: apwhy-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: apwhy
+      POSTGRES_USER: apwhy
+      POSTGRES_PASSWORD: ${APWHY_DB_PASSWORD:-apwhy123}
+    volumes:
+      - apwhy-db:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apwhy -d apwhy"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+    mem_limit: 512m
+    cpus: 0.75
 
   traefik:
     image: traefik:v3.2
@@ -105,6 +120,7 @@ services:
 
 volumes:
   apwhy-data:
+  apwhy-db:
   umami-db:
 
 networks:

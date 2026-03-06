@@ -2,8 +2,6 @@
 
 FROM node:20-alpine AS web-builder
 WORKDIR /app
-ARG VITE_BASE_PATH=/
-ENV VITE_BASE_PATH=$VITE_BASE_PATH
 COPY package*.json ./
 COPY postcss.config.cjs tailwind.config.cjs tsconfig.json vite.config.ts ./
 COPY web ./web
