@@ -50,6 +50,16 @@ func (c *Client) Status(scriptConfigured bool) map[string]any {
 		"tokenValid":            c.isTokenValid(),
 	}
 
+	// Try to authenticate if credentials are provided but no valid token
+	if c.Enabled() && !c.isTokenValid() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := c.TestAuth(ctx); err == nil {
+			status["tokenValid"] = true
+		}
+	}
+
 	if c.Enabled() && c.isTokenValid() {
 		status["message"] = "Umami API sync is configured."
 		return status
@@ -70,6 +80,20 @@ func (c *Client) Status(scriptConfigured bool) map[string]any {
 	}
 	status["message"] = "Umami API sync is disabled. Missing: " + strings.Join(missing, ", ") + "."
 	return status
+}
+
+// TestAuth attempts to authenticate and returns any error
+func (c *Client) TestAuth(ctx context.Context) error {
+	if !c.Enabled() {
+		return fmt.Errorf("client not enabled - missing credentials")
+	}
+
+	_, err := c.getValidToken(ctx)
+	if err != nil {
+		return fmt.Errorf("authentication failed: %w", err)
+	}
+
+	return nil
 }
 
 func (c *Client) FetchTraffic(ctx context.Context, from, to time.Time) (map[string]any, error) {
@@ -154,28 +178,28 @@ func (c *Client) refreshToken(ctx context.Context) (string, error) {
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, loginURL, strings.NewReader(string(body)))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create login request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	res, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to execute login request: %w", err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		return "", fmt.Errorf("login failed: %d", res.StatusCode)
+		return "", fmt.Errorf("login failed with status %d", res.StatusCode)
 	}
 
 	var response map[string]any
 	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to decode login response: %w", err)
 	}
 
 	token, ok := response["token"].(string)
 	if !ok {
-		return "", fmt.Errorf("no token in response")
+		return "", fmt.Errorf("no token in login response")
 	}
 
 	c.tokenMu.Lock()
