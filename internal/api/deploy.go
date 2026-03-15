@@ -142,7 +142,10 @@ func (s *DeployService) RuntimeStatus(ctx context.Context) DeploymentRuntimeStat
 		status.DockerReachableInfo = info
 	}
 
-	status.CanDeploy = status.GitAvailable && status.DockerAvailable && status.DockerReachable && (status.RailpackAvailable || status.GoAvailable)
+	// Can deploy if Git is available AND either:
+	// 1. Docker is reachable (for container deployments) OR
+	// 2. Go is available (for native binary deployments)
+	status.CanDeploy = status.GitAvailable && (status.DockerReachable || status.GoAvailable)
 	return status
 }
 
@@ -750,13 +753,20 @@ func dockerReachable(parent context.Context) (bool, string) {
 	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
 	defer cancel()
 
-	output, err := exec.CommandContext(ctx, "docker", "info", "--format", "{{.ServerVersion}}").CombinedOutput()
-	trimmed := strings.TrimSpace(string(output))
+	// Try a simple docker command first
+	output, err := exec.CommandContext(ctx, "docker", "ps").CombinedOutput()
 	if err != nil {
-		if trimmed != "" {
+		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
 			return false, trimmed
 		}
 		return false, err.Error()
+	}
+
+	// Try to get version info
+	versionOutput, versionErr := exec.CommandContext(ctx, "docker", "version", "--format", "{{.ServerVersion}}").CombinedOutput()
+	trimmed := strings.TrimSpace(string(versionOutput))
+	if versionErr != nil {
+		return true, "Docker daemon reachable but version query failed"
 	}
 	if trimmed == "" {
 		return true, "Docker daemon reachable."
