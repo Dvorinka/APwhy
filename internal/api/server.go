@@ -73,7 +73,7 @@ func NewServer(store *storage.Store, cfg config.Config) *Server {
 		Store:         store,
 		Cfg:           cfg,
 		DeployService: NewDeployService(),
-		Umami:         analytics.NewClient(cfg.UmamiBaseURL, cfg.UmamiAPIKey, cfg.UmamiWebsiteID),
+		Umami:         analytics.NewClient(cfg.UmamiBaseURL, cfg.UmamiUsername, cfg.UmamiPassword, cfg.UmamiWebsiteID),
 		proxyClient: &http.Client{
 			Timeout: cfg.DefaultServiceTimeout,
 		},

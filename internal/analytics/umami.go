@@ -7,20 +7,28 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Client struct {
 	BaseURL   string
-	APIKey    string
+	Username  string
+	Password  string
 	WebsiteID string
 	HTTP      *http.Client
+
+	// JWT token management
+	token    string
+	tokenExp time.Time
+	tokenMu  sync.RWMutex
 }
 
-func NewClient(baseURL, apiKey, websiteID string) *Client {
+func NewClient(baseURL, username, password, websiteID string) *Client {
 	return &Client{
 		BaseURL:   baseURL,
-		APIKey:    apiKey,
+		Username:  username,
+		Password:  password,
 		WebsiteID: websiteID,
 		HTTP: &http.Client{
 			Timeout: 10 * time.Second,
@@ -29,19 +37,20 @@ func NewClient(baseURL, apiKey, websiteID string) *Client {
 }
 
 func (c *Client) Enabled() bool {
-	return c.BaseURL != "" && c.APIKey != "" && c.WebsiteID != ""
+	return c.BaseURL != "" && c.Username != "" && c.Password != ""
 }
 
 func (c *Client) Status(scriptConfigured bool) map[string]any {
 	status := map[string]any{
-		"enabled":             c.Enabled(),
-		"scriptConfigured":    scriptConfigured,
-		"baseURLConfigured":   c.BaseURL != "",
-		"apiKeyConfigured":    c.APIKey != "",
-		"websiteConfigured":   c.WebsiteID != "",
+		"enabled":               c.Enabled(),
+		"scriptConfigured":      scriptConfigured,
+		"baseURLConfigured":     c.BaseURL != "",
+		"credentialsConfigured": c.Username != "" && c.Password != "",
+		"websiteConfigured":     c.WebsiteID != "",
+		"tokenValid":            c.isTokenValid(),
 	}
 
-	if c.Enabled() {
+	if c.Enabled() && c.isTokenValid() {
 		status["message"] = "Umami API sync is configured."
 		return status
 	}
@@ -50,8 +59,11 @@ func (c *Client) Status(scriptConfigured bool) map[string]any {
 	if c.BaseURL == "" {
 		missing = append(missing, "base URL")
 	}
-	if c.APIKey == "" {
-		missing = append(missing, "API key/token")
+	if c.Username == "" || c.Password == "" {
+		missing = append(missing, "username/password")
+	}
+	if !c.isTokenValid() {
+		missing = append(missing, "valid JWT token")
 	}
 	if c.WebsiteID == "" {
 		missing = append(missing, "website ID")
@@ -67,7 +79,21 @@ func (c *Client) FetchTraffic(ctx context.Context, from, to time.Time) (map[stri
 		}, nil
 	}
 
-	u, err := url.Parse(fmt.Sprintf("%s/api/websites/%s/stats", c.BaseURL, c.WebsiteID))
+	token, err := c.getValidToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get auth token: %w", err)
+	}
+
+	websiteID := c.WebsiteID
+	if websiteID == "" {
+		websiteID, err = c.getOrCreateWebsite(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get website ID: %w", err)
+		}
+		c.WebsiteID = websiteID
+	}
+
+	u, err := url.Parse(fmt.Sprintf("%s/api/websites/%s/stats", c.BaseURL, websiteID))
 	if err != nil {
 		return nil, err
 	}
@@ -81,8 +107,7 @@ func (c *Client) FetchTraffic(ctx context.Context, from, to time.Time) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.APIKey)
-	req.Header.Set("x-umami-api-key", c.APIKey)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
 
 	res, err := c.HTTP.Do(req)
@@ -101,4 +126,132 @@ func (c *Client) FetchTraffic(ctx context.Context, from, to time.Time) (map[stri
 	}
 	payload["enabled"] = true
 	return payload, nil
+}
+
+func (c *Client) isTokenValid() bool {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.token != "" && time.Now().Before(c.tokenExp)
+}
+
+func (c *Client) getValidToken(ctx context.Context) (string, error) {
+	if c.isTokenValid() {
+		c.tokenMu.RLock()
+		defer c.tokenMu.RUnlock()
+		return c.token, nil
+	}
+
+	return c.refreshToken(ctx)
+}
+
+func (c *Client) refreshToken(ctx context.Context) (string, error) {
+	loginURL := fmt.Sprintf("%s/api/auth/login", c.BaseURL)
+	payload := map[string]string{
+		"username": c.Username,
+		"password": c.Password,
+	}
+
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, loginURL, strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		return "", fmt.Errorf("login failed: %d", res.StatusCode)
+	}
+
+	var response map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		return "", err
+	}
+
+	token, ok := response["token"].(string)
+	if !ok {
+		return "", fmt.Errorf("no token in response")
+	}
+
+	c.tokenMu.Lock()
+	c.token = token
+	c.tokenExp = time.Now().Add(23 * time.Hour) // 23 hour expiration
+	c.tokenMu.Unlock()
+
+	return token, nil
+}
+
+func (c *Client) getOrCreateWebsite(ctx context.Context) (string, error) {
+	token, err := c.getValidToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	// Try to find existing website
+	websitesURL := fmt.Sprintf("%s/api/websites", c.BaseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, websitesURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+
+	res, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode == 200 {
+		var websites []map[string]any
+		if err := json.NewDecoder(res.Body).Decode(&websites); err == nil {
+			for _, website := range websites {
+				if id, ok := website["id"].(string); ok && id != "" {
+					return id, nil // Use first available website
+				}
+			}
+		}
+	}
+
+	// Create new website
+	createURL := fmt.Sprintf("%s/api/websites", c.BaseURL)
+	payload := map[string]interface{}{
+		"name":   "APwhy Analytics",
+		"domain": "apwhy",
+	}
+
+	body, _ := json.Marshal(payload)
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, createURL, strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err = c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		return "", fmt.Errorf("failed to create website: %d", res.StatusCode)
+	}
+
+	var response map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		return "", err
+	}
+
+	websiteID, ok := response["id"].(string)
+	if !ok {
+		return "", fmt.Errorf("no website ID in response")
+	}
+
+	return websiteID, nil
 }

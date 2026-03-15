@@ -16,7 +16,8 @@ type Config struct {
 	AllowRootRoutePrefix  bool
 	DefaultServiceTimeout time.Duration
 	UmamiBaseURL          string
-	UmamiAPIKey           string
+	UmamiUsername         string
+	UmamiPassword         string
 	UmamiScriptURL        string
 	UmamiWebsiteID        string
 	TrustedProxyCIDR      string
@@ -94,7 +95,8 @@ func Load() Config {
 			getenvInt("DEFAULT_SERVICE_TIMEOUT_MS", 8000),
 		) * time.Millisecond,
 		UmamiBaseURL:     deriveUmamiBaseURL(getenv("UMAMI_BASE_URL", ""), umamiScriptURL),
-		UmamiAPIKey:      getenv("UMAMI_API_KEY", ""),
+		UmamiUsername:    getenv("UMAMI_USERNAME", ""),
+		UmamiPassword:    getenv("UMAMI_PASSWORD", ""),
 		UmamiScriptURL:   umamiScriptURL,
 		UmamiWebsiteID:   getenv("UMAMI_WEBSITE_ID", ""),
 		TrustedProxyCIDR: getenv("TRUSTED_PROXY_CIDR", ""),
