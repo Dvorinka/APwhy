@@ -57,6 +57,8 @@ func (c *Client) Status(scriptConfigured bool) map[string]any {
 
 		if err := c.TestAuth(ctx); err == nil {
 			status["tokenValid"] = true
+		} else {
+			status["authError"] = err.Error()
 		}
 	}
 
@@ -85,7 +87,8 @@ func (c *Client) Status(scriptConfigured bool) map[string]any {
 // TestAuth attempts to authenticate and returns any error
 func (c *Client) TestAuth(ctx context.Context) error {
 	if !c.Enabled() {
-		return fmt.Errorf("client not enabled - missing credentials")
+		return fmt.Errorf("client not enabled - missing credentials (baseURL: %q, username: %q, password: %q)",
+			c.BaseURL, c.Username, "***")
 	}
 
 	_, err := c.getValidToken(ctx)

@@ -756,7 +756,13 @@ func dockerReachable(parent context.Context) (bool, string) {
 	// Try a simple docker command first
 	output, err := exec.CommandContext(ctx, "docker", "ps").CombinedOutput()
 	if err != nil {
-		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
+		trimmed := strings.TrimSpace(string(output))
+		if strings.Contains(trimmed, "Cannot connect to the Docker daemon") ||
+			strings.Contains(trimmed, "docker daemon not running") ||
+			strings.Contains(err.Error(), "Cannot connect to the Docker daemon") {
+			return false, "Docker daemon not available (expected in containers)"
+		}
+		if trimmed != "" {
 			return false, trimmed
 		}
 		return false, err.Error()
