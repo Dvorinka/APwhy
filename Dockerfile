@@ -8,7 +8,7 @@ COPY web ./web
 RUN npm ci
 RUN npm run build:web
 
-FROM golang:1.25-alpine AS go-builder
+FROM golang:1.24-alpine AS go-builder
 WORKDIR /app
 RUN apk add --no-cache git
 COPY go.mod go.sum* ./
@@ -17,7 +17,7 @@ COPY . .
 COPY --from=web-builder /app/internal/api/static ./internal/api/static
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /out/apwhy ./cmd/apwhy
 
-FROM golang:1.25-bookworm AS runtime
+FROM golang:1.24-bookworm AS runtime
 WORKDIR /app
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl docker.io git \
