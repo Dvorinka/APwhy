@@ -38,6 +38,50 @@ export interface DatabaseItem {
   lastValidationAt: string | null;
 }
 
+export interface DeploymentItem {
+  id: string;
+  name: string;
+  status: string;
+  buildSystem?: string;
+  detectedProviders?: string[];
+  logs?: string;
+  url?: string;
+  routePrefix?: string;
+  publicUrl?: string;
+  serviceId?: string;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DeployRuntimeStatus {
+  baseDir: string;
+  buildKitHost: string;
+  gitAvailable: boolean;
+  gitVersion?: string;
+  gitError?: string;
+  dockerAvailable: boolean;
+  dockerVersion?: string;
+  dockerError?: string;
+  dockerReachable: boolean;
+  dockerReachableInfo?: string;
+  railpackAvailable: boolean;
+  railpackVersion?: string;
+  railpackError?: string;
+  goAvailable: boolean;
+  goVersion?: string;
+  goError?: string;
+  dockerNetwork?: string;
+  canDeploy: boolean;
+}
+
+export interface HealthStatus {
+  status: string;
+  name: string;
+  database: string;
+  generatedAt: string;
+}
+
 export interface ApiKeyItem {
   id: string;
   name: string;

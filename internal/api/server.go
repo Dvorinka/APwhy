@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"mime"
@@ -72,7 +73,7 @@ func NewServer(store *storage.Store, cfg config.Config) *Server {
 		Store:         store,
 		Cfg:           cfg,
 		DeployService: NewDeployService(),
-		Umami:         analytics.NewClient("", "", cfg.UmamiWebsiteID),
+		Umami:         analytics.NewClient(cfg.UmamiBaseURL, cfg.UmamiAPIKey, cfg.UmamiWebsiteID),
 		proxyClient: &http.Client{
 			Timeout: cfg.DefaultServiceTimeout,
 		},
@@ -122,11 +123,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/analytics/ops", s.withAuth("analytics.read", false, s.handleAnalyticsOps))
 	mux.HandleFunc("GET /api/v1/analytics/traffic", s.withAuth("analytics.read", false, s.handleAnalyticsTraffic))
 	mux.HandleFunc("POST /api/v1/analytics/events", s.withAuth("", true, s.handleAnalyticsEvents))
-	mux.HandleFunc("POST /api/v1/deploy", s.withAuth("deploy.write", false, func(w http.ResponseWriter, r *http.Request, _ *authContext) {
-		s.handleDeployCreate(w, r)
+	mux.HandleFunc("POST /api/v1/deploy", s.withAuth("deploy.write", false, func(w http.ResponseWriter, r *http.Request, ctx *authContext) {
+		s.handleDeployCreate(w, r, ctx)
 	}))
 	mux.HandleFunc("GET /api/v1/deploy", s.withAuth("deploy.read", false, func(w http.ResponseWriter, r *http.Request, _ *authContext) {
 		s.handleDeployList(w, r)
+	}))
+	mux.HandleFunc("GET /api/v1/deploy/runtime", s.withAuth("deploy.read", false, func(w http.ResponseWriter, r *http.Request, _ *authContext) {
+		s.handleDeployRuntime(w, r)
+	}))
+	mux.HandleFunc("GET /api/v1/deploy/port-check", s.withAuth("deploy.read", false, func(w http.ResponseWriter, r *http.Request, _ *authContext) {
+		s.handleDeployPortCheck(w, r)
 	}))
 	mux.HandleFunc("GET /api/v1/deploy/{id}", s.withAuth("deploy.read", false, func(w http.ResponseWriter, r *http.Request, _ *authContext) {
 		s.handleDeployGet(w, r)
@@ -148,6 +155,19 @@ func (s *Server) withSecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		// CORS headers
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		// Handle preflight requests
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		next.ServeHTTP(w, r)
 	})
 }
@@ -193,7 +213,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"data": map[string]any{
 			"status":      "ok",
 			"name":        "APwhy",
-			"database":    "sqlite",
+			"database":    databaseKindFromURL(s.Cfg.DatabaseURL),
 			"generatedAt": time.Now().UTC().Format(time.RFC3339),
 		},
 	})
@@ -963,13 +983,9 @@ func (s *Server) handleServicesCreate(w http.ResponseWriter, r *http.Request, ct
 		writeError(w, http.StatusBadRequest, "INVALID_UPSTREAM", "Service upstream URL is required")
 		return
 	}
-	routePrefix := normalizePathPrefix(input.RoutePrefix, "/"+slugify(input.Name, "service"))
-	if routePrefix == "/" && !s.Cfg.AllowRootRoutePrefix {
-		writeError(w, http.StatusBadRequest, "ROOT_ROUTE_DISABLED", "Route prefix '/' is disabled")
-		return
-	}
-	if strings.HasPrefix(routePrefix, "/api/") {
-		writeError(w, http.StatusBadRequest, "ROUTE_CONFLICT", "Route prefix conflicts with internal API")
+	routePrefix, err := s.validateServiceRoutePrefix(r.Context(), firstNonEmpty(input.RoutePrefix, "/"+slugify(input.Name, "service")), "")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "ROUTE_CONFLICT", err.Error())
 		return
 	}
 
@@ -977,7 +993,7 @@ func (s *Server) handleServicesCreate(w http.ResponseWriter, r *http.Request, ct
 	id, _ := auth.RandomID("svc")
 	slug := slugify(firstNonEmpty(input.Slug, input.Name), "service")
 
-	_, err := s.Store.ExecContext(r.Context(), `
+	_, err = s.Store.ExecContext(r.Context(), `
 		INSERT INTO services (
 			id, name, slug, upstream_url, route_prefix, health_path,
 			upstream_auth_header, upstream_auth_value, internal_token,
@@ -1030,9 +1046,9 @@ func (s *Server) handleServicesPatch(w http.ResponseWriter, r *http.Request, ctx
 	}
 
 	name := firstNonEmpty(patch.Name, asString(current["name"]))
-	routePrefix := normalizePathPrefix(firstNonEmpty(patch.RoutePrefix, asString(current["routePrefix"])), "/")
-	if routePrefix == "/" && !s.Cfg.AllowRootRoutePrefix {
-		writeError(w, http.StatusBadRequest, "ROOT_ROUTE_DISABLED", "Route prefix '/' is disabled")
+	routePrefix, err := s.validateServiceRoutePrefix(r.Context(), firstNonEmpty(patch.RoutePrefix, asString(current["routePrefix"])), id)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "ROUTE_CONFLICT", err.Error())
 		return
 	}
 
@@ -1455,11 +1471,12 @@ func (s *Server) handleKeysPatch(w http.ResponseWriter, r *http.Request, ctx *au
 
 func (s *Server) handleAnalyticsOps(w http.ResponseWriter, r *http.Request, ctx *authContext) {
 	counts := map[string]int{}
-	for _, table := range []string{"users", "services", "database_connections", "api_keys"} {
+	for _, table := range []string{"users", "services", "api_keys"} {
 		var count int
 		_ = s.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM `+table).Scan(&count)
 		counts[table] = count
 	}
+	counts["deployments"] = len(s.DeployService.ListDeployments())
 
 	period := time.Now().UTC().Format("2006-01")
 	var monthlyRequests int
@@ -1522,10 +1539,10 @@ func (s *Server) handleAnalyticsOps(w http.ResponseWriter, r *http.Request, ctx 
 		"ok": true,
 		"data": map[string]any{
 			"counts": map[string]any{
-				"users":     counts["users"],
-				"services":  counts["services"],
-				"databases": counts["database_connections"],
-				"keys":      counts["api_keys"],
+				"users":       counts["users"],
+				"services":    counts["services"],
+				"deployments": counts["deployments"],
+				"keys":        counts["api_keys"],
 			},
 			"requests": map[string]any{
 				"period": period,
@@ -1542,6 +1559,7 @@ func (s *Server) handleAnalyticsOps(w http.ResponseWriter, r *http.Request, ctx 
 func (s *Server) handleAnalyticsTraffic(w http.ResponseWriter, r *http.Request, ctx *authContext) {
 	from := time.Now().Add(-7 * 24 * time.Hour)
 	to := time.Now()
+	umamiStatus := s.Umami.Status(strings.TrimSpace(s.Cfg.UmamiScriptURL) != "" && strings.TrimSpace(s.Cfg.UmamiWebsiteID) != "")
 	if value := strings.TrimSpace(r.URL.Query().Get("from")); value != "" {
 		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
 			from = parsed
@@ -1555,6 +1573,7 @@ func (s *Server) handleAnalyticsTraffic(w http.ResponseWriter, r *http.Request, 
 
 	traffic, err := s.Umami.FetchTraffic(r.Context(), from, to)
 	if err == nil {
+		traffic["config"] = umamiStatus
 		_, _ = s.Store.ExecContext(r.Context(), `
 			INSERT INTO umami_sync_cache (cache_key, payload_json, updated_at)
 			VALUES ('traffic', ?, ?)
@@ -1569,6 +1588,7 @@ func (s *Server) handleAnalyticsTraffic(w http.ResponseWriter, r *http.Request, 
 		if traffic == nil {
 			traffic = map[string]any{"enabled": false, "error": err.Error()}
 		}
+		traffic["config"] = umamiStatus
 	}
 
 	eventRows, _ := s.Store.QueryContext(r.Context(), `
@@ -1671,11 +1691,37 @@ func (s *Server) serveWeb(w http.ResponseWriter, requestPath string) {
 		writeError(w, http.StatusNotFound, "FRONTEND_NOT_BUILT", "Frontend build is not available")
 		return
 	}
+	if reqPath == "index.html" {
+		data = injectUmamiScript(data, s.Cfg.UmamiScriptURL, s.Cfg.UmamiWebsiteID)
+	}
 
 	if contentType := mime.TypeByExtension(path.Ext(reqPath)); contentType != "" {
 		w.Header().Set("Content-Type", contentType)
 	}
 	_, _ = w.Write(data)
+}
+
+func injectUmamiScript(indexHTML []byte, scriptURL, websiteID string) []byte {
+	scriptURL = strings.TrimSpace(scriptURL)
+	websiteID = strings.TrimSpace(websiteID)
+	if scriptURL == "" || websiteID == "" {
+		return indexHTML
+	}
+
+	snippet := fmt.Sprintf(
+		`<script defer src="%s" data-website-id="%s"></script>`,
+		html.EscapeString(scriptURL),
+		html.EscapeString(websiteID),
+	)
+
+	content := string(indexHTML)
+	if strings.Contains(content, snippet) {
+		return indexHTML
+	}
+	if strings.Contains(content, "</head>") {
+		return []byte(strings.Replace(content, "</head>", "  "+snippet+"\n  </head>", 1))
+	}
+	return indexHTML
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, service map[string]any) {
@@ -2276,6 +2322,158 @@ func (s *Server) logMetric(metric string, value float64, labels map[string]any) 
 	return err
 }
 
+func (s *Server) autoExposeDeployment(deploymentID string, req DeployRequest, actorUserID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	publicURL := s.publicRouteURL(req.RoutePrefix)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		deployment, exists := s.DeployService.GetDeployment(deploymentID)
+		if !exists {
+			return
+		}
+
+		switch deployment.Status {
+		case "running":
+			upstreamURL := strings.TrimSpace(deployment.URL)
+			if upstreamURL == "" {
+				break
+			}
+
+			serviceID, err := s.createServiceForDeployment(ctx, deployment, req)
+			if err != nil {
+				s.DeployService.appendLog(deploymentID, "Protected route creation failed: "+err.Error())
+				return
+			}
+
+			s.DeployService.setExposure(deploymentID, req.RoutePrefix, publicURL, serviceID)
+			s.DeployService.appendLog(deploymentID, "Protected route ready at "+publicURL)
+			go s.watchManagedServiceDeployment(deploymentID, serviceID)
+			if strings.TrimSpace(actorUserID) != "" {
+				s.audit(ctx, actorUserID, "services.create", "service", serviceID, map[string]any{
+					"deploymentId": deploymentID,
+					"routePrefix":  req.RoutePrefix,
+					"upstreamUrl":  upstreamURL,
+					"managedBy":    "deployment",
+				})
+			}
+			return
+		case "failed", "stopped":
+			s.DeployService.appendLog(deploymentID, "Protected route was not created because the deployment is not running.")
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			s.DeployService.appendLog(deploymentID, "Timed out waiting for the deployment to become routable.")
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) createServiceForDeployment(ctx context.Context, deployment *DeployStatus, req DeployRequest) (string, error) {
+	routePrefix, err := s.validateServiceRoutePrefix(ctx, req.RoutePrefix, "")
+	if err != nil {
+		return "", err
+	}
+
+	serviceID, _ := auth.RandomID("svc")
+	now := storage.NowISO()
+	slug := slugify(firstNonEmpty(req.Name, deployment.Name), "service") + "-" + shortID(deployment.ID)
+
+	_, err = s.Store.ExecContext(ctx, `
+		INSERT INTO services (
+			id, name, slug, upstream_url, route_prefix, health_path,
+			upstream_auth_header, upstream_auth_value, internal_token,
+			enabled, rpm_limit, monthly_quota, request_timeout_ms,
+			created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		serviceID,
+		firstNonEmpty(req.Name, deployment.Name),
+		slug,
+		strings.TrimSpace(deployment.URL),
+		routePrefix,
+		normalizePathPrefix(req.HealthPath, "/health"),
+		nil,
+		nil,
+		nil,
+		1,
+		nil,
+		nil,
+		nil,
+		now,
+		now,
+	)
+	if err != nil {
+		return "", err
+	}
+	return serviceID, nil
+}
+
+func (s *Server) validateServiceRoutePrefix(ctx context.Context, raw, excludeServiceID string) (string, error) {
+	routePrefix := normalizePathPrefix(raw, "/")
+	if routePrefix == "/" && !s.Cfg.AllowRootRoutePrefix {
+		return "", errors.New("route prefix '/' is disabled")
+	}
+	if strings.HasPrefix(routePrefix, "/api/") {
+		return "", errors.New("route prefix conflicts with internal API")
+	}
+
+	uiBasePath := normalizePathPrefix(s.Cfg.DashboardUIBasePath, "/")
+	if uiBasePath != "/" && (routePrefix == uiBasePath || strings.HasPrefix(routePrefix, uiBasePath+"/")) {
+		return "", fmt.Errorf("route prefix conflicts with dashboard path %s", uiBasePath)
+	}
+
+	var existingID string
+	err := s.Store.QueryRowContext(ctx, `SELECT id FROM services WHERE route_prefix = ?`, routePrefix).Scan(&existingID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	if existingID != "" && existingID != excludeServiceID {
+		return "", errors.New("route prefix already exists")
+	}
+
+	return routePrefix, nil
+}
+
+func (s *Server) publicRouteURL(routePrefix string) string {
+	routePrefix = normalizePathPrefix(routePrefix, "/")
+	if strings.TrimSpace(s.Cfg.PublicBaseURL) == "" {
+		return routePrefix
+	}
+	return strings.TrimRight(s.Cfg.PublicBaseURL, "/") + routePrefix
+}
+
+func (s *Server) watchManagedServiceDeployment(deploymentID, serviceID string) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		deployment, exists := s.DeployService.GetDeployment(deploymentID)
+		if !exists {
+			return
+		}
+
+		switch deployment.Status {
+		case "queued", "cloning", "building", "running":
+			continue
+		case "failed", "stopped":
+			_, _ = s.Store.ExecContext(context.Background(), `
+				UPDATE services SET enabled = 0, updated_at = ? WHERE id = ?
+			`, storage.NowISO(), serviceID)
+			s.DeployService.appendLog(deploymentID, "Protected route disabled because the deployment is no longer running.")
+			return
+		default:
+			return
+		}
+	}
+}
+
 func (s *Server) audit(ctx context.Context, actorUserID, action, targetType, targetID string, payload any) {
 	_, _ = s.Store.ExecContext(ctx, `
 		INSERT INTO audit_log (actor_user_id, action, target_type, target_id, payload_json, occurred_at)
@@ -2739,6 +2937,20 @@ func webPathForRequest(requestPath string, uiBasePath string) (string, bool) {
 	return "", false
 }
 
+func databaseKindFromURL(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch {
+	case strings.HasPrefix(value, "postgres://"), strings.HasPrefix(value, "postgresql://"):
+		return "postgres"
+	case strings.HasPrefix(value, "mysql://"):
+		return "mysql"
+	case value == "":
+		return "unknown"
+	default:
+		return "configured"
+	}
+}
+
 func upstreamOr(a, b sql.NullString) sql.NullString {
 	if a.Valid {
 		return a
@@ -2776,17 +2988,49 @@ func (s serviceInput) MonthlyQuotaOr(value any) *int {
 }
 
 // Deployment handlers
-func (s *Server) handleDeployCreate(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleDeployCreate(w http.ResponseWriter, r *http.Request, ctx *authContext) {
 	var req DeployRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_JSON", "Invalid JSON")
+	if err := decodeJSON(r.Body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", err.Error())
 		return
+	}
+
+	req.RoutePrefix = strings.TrimSpace(req.RoutePrefix)
+	if req.RoutePrefix != "" {
+		if ctx == nil || !ctx.Permissions["services.write"] {
+			writeError(w, http.StatusForbidden, "FORBIDDEN", "Managing a protected route requires services.write permission")
+			return
+		}
+		routePrefix, err := s.validateServiceRoutePrefix(r.Context(), req.RoutePrefix, "")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "ROUTE_CONFLICT", err.Error())
+			return
+		}
+		req.RoutePrefix = routePrefix
+		req.HealthPath = normalizePathPrefix(req.HealthPath, "/health")
 	}
 
 	deployment, err := s.DeployService.CreateDeployment(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "DEPLOY_FAILED", err.Error())
 		return
+	}
+
+	if req.RoutePrefix != "" {
+		publicURL := s.publicRouteURL(req.RoutePrefix)
+		s.DeployService.setExposure(deployment.ID, req.RoutePrefix, publicURL, "")
+		go s.autoExposeDeployment(deployment.ID, req, ctx.UserID)
+	}
+
+	if ctx != nil {
+		s.audit(r.Context(), ctx.UserID, "deploy.create", "deployment", deployment.ID, map[string]any{
+			"githubUrl":            req.GitHubURL,
+			"name":                 req.Name,
+			"branch":               req.Branch,
+			"routePrefix":          req.RoutePrefix,
+			"healthPath":           req.HealthPath,
+			"autoFixPortConflicts": req.AutoFixPortConflicts,
+		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2799,6 +3043,39 @@ func (s *Server) handleDeployList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"deployments": deployments,
+	})
+}
+
+func (s *Server) handleDeployRuntime(w http.ResponseWriter, r *http.Request) {
+	status := s.DeployService.RuntimeStatus(r.Context())
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"runtime": status,
+	})
+}
+
+func (s *Server) handleDeployPortCheck(w http.ResponseWriter, r *http.Request) {
+	rawPort := strings.TrimSpace(r.URL.Query().Get("port"))
+	if rawPort == "" {
+		writeError(w, http.StatusBadRequest, "MISSING_PORT", "Port query parameter required")
+		return
+	}
+
+	port, used, reason, err := s.DeployService.CheckPortAvailability(rawPort)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_PORT", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok": true,
+		"data": map[string]interface{}{
+			"port":   port,
+			"used":   used,
+			"reason": reason,
+		},
 	})
 }
 
@@ -2826,9 +3103,18 @@ func (s *Server) handleDeployStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	deployment, _ := s.DeployService.GetDeployment(id)
+
 	if err := s.DeployService.StopDeployment(r.Context(), id); err != nil {
 		writeError(w, http.StatusBadRequest, "DEPLOY_STOP_FAILED", err.Error())
 		return
+	}
+
+	if deployment != nil && strings.TrimSpace(deployment.ServiceID) != "" {
+		_, _ = s.Store.ExecContext(r.Context(), `
+			UPDATE services SET enabled = 0, updated_at = ? WHERE id = ?
+		`, storage.NowISO(), deployment.ServiceID)
+		s.DeployService.appendLog(id, "Protected route disabled because the deployment was stopped.")
 	}
 
 	w.Header().Set("Content-Type", "application/json")

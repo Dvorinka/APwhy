@@ -8,17 +8,28 @@ services:
     environment:
       APWHY_PORT: 3001
       DATABASE_URL: postgresql://apwhy:${APWHY_DB_PASSWORD:-apwhy123}@apwhy-db:5432/apwhy
+      APWHY_PUBLIC_BASE_URL: ${APWHY_PUBLIC_BASE_URL:-http://localhost:3001}
+      APWHY_DEPLOY_BASE_DIR: /data/deployments
+      BUILDKIT_HOST: ${BUILDKIT_HOST:-docker-container://apwhy-buildkit}
+      APWHY_DEPLOY_DOCKER_NETWORK: ${APWHY_DEPLOY_DOCKER_NETWORK:-apwhy-network}
+      UMAMI_BASE_URL: ${UMAMI_BASE_URL:-}
+      UMAMI_API_KEY: ${UMAMI_API_KEY:-}
       UMAMI_SCRIPT_URL: ${UMAMI_SCRIPT_URL:-}
       UMAMI_WEBSITE_ID: ${UMAMI_WEBSITE_ID:-}
     depends_on:
       apwhy-db:
         condition: service_healthy
+      buildkit:
+        condition: service_started
     networks:
       - apwhy-network
     ports:
       - "3001:3001"
+    volumes:
+      - apwhy-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
-      test: ["CMD", "wget", "-qO", "-", "http://127.0.0.1:3001/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3001/health"]
       interval: 20s
       timeout: 5s
       retries: 5
@@ -47,9 +58,19 @@ services:
     mem_limit: 512m
     cpus: 0.75
 
+  buildkit:
+    image: moby/buildkit:latest
+    container_name: apwhy-buildkit
+    privileged: true
+    restart: unless-stopped
+    networks:
+      - apwhy-network
+
 volumes:
+  apwhy-data:
   apwhy-db:
 
 networks:
   apwhy-network:
     driver: bridge
+    name: apwhy-network

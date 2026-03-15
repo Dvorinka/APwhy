@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -31,6 +32,34 @@ func (c *Client) Enabled() bool {
 	return c.BaseURL != "" && c.APIKey != "" && c.WebsiteID != ""
 }
 
+func (c *Client) Status(scriptConfigured bool) map[string]any {
+	status := map[string]any{
+		"enabled":             c.Enabled(),
+		"scriptConfigured":    scriptConfigured,
+		"baseURLConfigured":   c.BaseURL != "",
+		"apiKeyConfigured":    c.APIKey != "",
+		"websiteConfigured":   c.WebsiteID != "",
+	}
+
+	if c.Enabled() {
+		status["message"] = "Umami API sync is configured."
+		return status
+	}
+
+	missing := []string{}
+	if c.BaseURL == "" {
+		missing = append(missing, "base URL")
+	}
+	if c.APIKey == "" {
+		missing = append(missing, "API key/token")
+	}
+	if c.WebsiteID == "" {
+		missing = append(missing, "website ID")
+	}
+	status["message"] = "Umami API sync is disabled. Missing: " + strings.Join(missing, ", ") + "."
+	return status
+}
+
 func (c *Client) FetchTraffic(ctx context.Context, from, to time.Time) (map[string]any, error) {
 	if !c.Enabled() {
 		return map[string]any{
@@ -53,6 +82,7 @@ func (c *Client) FetchTraffic(ctx context.Context, from, to time.Time) (map[stri
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	req.Header.Set("x-umami-api-key", c.APIKey)
 	req.Header.Set("Accept", "application/json")
 
 	res, err := c.HTTP.Do(req)

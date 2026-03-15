@@ -3,23 +3,61 @@ import type {
   AuthUser,
   BootstrapStatus,
   DatabaseItem,
+  DeploymentItem,
+  DeployRuntimeStatus,
+  HealthStatus,
   PermissionItem,
   RoleItem,
   ServiceItem,
   UserItem,
 } from "./types";
 
+function normalizeDeploymentItem(raw: any): DeploymentItem {
+  return {
+    id: raw?.id || "",
+    name: raw?.name || "",
+    status: raw?.status || "",
+    buildSystem: raw?.build_system || raw?.buildSystem,
+    detectedProviders: raw?.detected_providers || raw?.detectedProviders || [],
+    logs: raw?.logs,
+    url: raw?.url,
+    routePrefix: raw?.route_prefix || raw?.routePrefix,
+    publicUrl: raw?.public_url || raw?.publicUrl,
+    serviceId: raw?.service_id || raw?.serviceId,
+    error: raw?.error,
+    createdAt: raw?.created_at || raw?.createdAt || "",
+    updatedAt: raw?.updated_at || raw?.updatedAt || "",
+  };
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {}),
-    },
-    ...init,
-  });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15000);
+  let response: Response;
+  try {
+    console.log(`API Request: ${path}`, init);
+    response = await fetch(path, {
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(init?.headers || {}),
+      },
+      ...init,
+      signal: controller.signal,
+    });
+    console.log(`API Response: ${path}`, response.status, response.statusText);
+  } catch (err) {
+    console.error(`API Error: ${path}`, err);
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("Request timed out. Check API/database connectivity.");
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 
   const payload = await response.json().catch(() => ({}));
+  console.log(`API Payload: ${path}`, payload);
   if (!response.ok) {
     throw new Error(payload?.error?.message || `Request failed (${response.status})`);
   }
@@ -149,6 +187,55 @@ export async function analyticsOps() {
 
 export async function analyticsTraffic() {
   return request<{ ok: boolean; data: any }>("/api/v1/analytics/traffic");
+}
+
+export async function fetchHealth(): Promise<HealthStatus> {
+  const payload = await request<{ ok: boolean; data: HealthStatus }>("/health");
+  return payload.data;
+}
+
+export async function listDeployments(): Promise<DeploymentItem[]> {
+  const payload = await request<{ deployments: Record<string, any> }>("/api/v1/deploy");
+  return Object.values(payload.deployments || {})
+    .map((item) => normalizeDeploymentItem(item))
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function createDeployment(input: {
+  github_url: string;
+  name: string;
+  branch?: string;
+  env_vars?: Record<string, string>;
+  route_prefix?: string;
+  health_path?: string;
+  auto_fix_port_conflicts?: boolean;
+}): Promise<DeploymentItem> {
+  const payload = await request<any>("/api/v1/deploy", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return normalizeDeploymentItem(payload);
+}
+
+export async function stopDeployment(id: string) {
+  return request(`/api/v1/deploy/${id}/stop`, { method: "POST" });
+}
+
+export async function checkDeployPort(port: string): Promise<{ port: string; used: boolean; reason?: string }> {
+  const payload = await request<{ ok: boolean; data: { port: string; used: boolean; reason?: string } }>(
+    `/api/v1/deploy/port-check?port=${encodeURIComponent(port)}`,
+  );
+  return payload.data;
+}
+
+export async function fetchDeploymentLogs(id: string, lines = 200): Promise<string> {
+  const payload = await request<{ logs: string }>(`/api/v1/deploy/${id}/logs?lines=${lines}`);
+  return payload.logs || "";
+}
+
+export async function fetchDeployRuntimeStatus(): Promise<DeployRuntimeStatus> {
+  const payload = await request<{ runtime: DeployRuntimeStatus }>("/api/v1/deploy/runtime");
+  return payload.runtime;
 }
 
 export async function trackEvent(event: string, path: string, meta?: Record<string, unknown>) {

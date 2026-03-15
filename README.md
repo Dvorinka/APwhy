@@ -57,6 +57,7 @@ Sessions are HTTP-only cookies with short-lived access tokens and rotating refre
 - Deployments: `POST|GET /api/v1/deploy`, `GET /api/v1/deploy/:id`, `POST /api/v1/deploy/:id/stop`, `GET /api/v1/deploy/:id/logs`
 - Build strategy: Railpack + Docker first (multi-language support)
 - Fallback: Go build/process for repositories containing `go.mod`
+- Optional same-domain exposure: deploy a repo and auto-publish it behind APwhy at a path like `/api-service-1`
 
 APwhy stores operational events locally and can ingest Umami API stats for traffic dashboards.
 
@@ -98,6 +99,10 @@ If you serve the dashboard under a subpath, set both:
 - `DASHBOARD_UI_BASE_PATH=/apwhy`
 - `VITE_BASE_PATH=/apwhy` (build-time for frontend asset paths)
 
+If deployed repos should be exposed through the same public APwhy domain, also set:
+- `APWHY_PUBLIC_BASE_URL=https://apwhy.example.com`
+- `APWHY_DEPLOY_DOCKER_NETWORK=<shared docker network>` when APwhy itself runs in Docker
+
 ### Run (API + Web)
 ```bash
 npm run dev
@@ -137,6 +142,12 @@ Update `.env` for real domains and secrets before production.
 2. Create API keys in the `Keys` tab and share the raw key with clients.
 3. Send requests to APwhy with your configured API key header (`x-api-key` by default).
 4. APwhy enforces key validity, service scope, per-minute limits, and monthly quotas before proxying upstream.
+
+For Git deployments, you can now set a `route_prefix` during deploy creation so APwhy deploys the repo and exposes it under the main domain automatically. Example result:
+- APwhy dashboard: `https://apwhy.example.com`
+- Deployed API: `https://apwhy.example.com/api-service-1`
+
+Only the APwhy port/domain needs to be public. The deployed service stays internal to APwhy and is proxied through the control plane.
 
 ## Production Notes
 - Set `COOKIE_SECURE=true` behind HTTPS.
